@@ -1,6 +1,7 @@
 package llb
 
 import (
+	"context"
 	_ "crypto/sha256"
 	"fmt"
 	"net"
@@ -12,18 +13,9 @@ import (
 	"github.com/pkg/errors"
 )
 
-type Meta struct {
-	Args       []string
-	Env        EnvList
-	Cwd        string
-	User       string
-	ProxyEnv   *ProxyEnv
-	ExtraHosts []HostIP
-	Network    pb.NetMode
-}
-
-func NewExecOp(root Output, meta Meta, readOnly bool, c Constraints) *ExecOp {
-	e := &ExecOp{meta: meta, constraints: c}
+func NewExecOp(base State, proxyEnv *ProxyEnv, readOnly bool, c Constraints) *ExecOp {
+	e := &ExecOp{base: base, constraints: c, proxyEnv: proxyEnv}
+	root := base.Output()
 	rootMount := &mount{
 		target:   pb.RootMount,
 		source:   root,
@@ -52,14 +44,15 @@ type mount struct {
 	cacheID      string
 	tmpfs        bool
 	cacheSharing CacheMountSharingMode
-	// hasOutput bool
+	noOutput     bool
 }
 
 type ExecOp struct {
 	MarshalCache
+	proxyEnv    *ProxyEnv
 	root        Output
 	mounts      []*mount
-	meta        Meta
+	base        State
 	constraints Constraints
 	isValidated bool
 	secrets     []SecretInfo
@@ -79,6 +72,8 @@ func (e *ExecOp) AddMount(target string, source Output, opt ...MountOption) Outp
 		m.output = source
 	} else if m.tmpfs {
 		m.output = &output{vertex: e, err: errors.Errorf("tmpfs mount for %s can't be used as a parent", target)}
+	} else if m.noOutput {
+		m.output = &output{vertex: e, err: errors.Errorf("mount marked no-output and %s can't be used as a parent", target)}
 	} else {
 		o := &output{vertex: e, getIndex: e.getMountIndexFn(m)}
 		if p := e.constraints.Platform; p != nil {
@@ -86,7 +81,7 @@ func (e *ExecOp) AddMount(target string, source Output, opt ...MountOption) Outp
 		}
 		m.output = o
 	}
-	e.Store(nil, nil, nil)
+	e.Store(nil, nil, nil, nil)
 	e.isValidated = false
 	return m.output
 }
@@ -100,19 +95,27 @@ func (e *ExecOp) GetMount(target string) Output {
 	return nil
 }
 
-func (e *ExecOp) Validate() error {
+func (e *ExecOp) Validate(ctx context.Context) error {
 	if e.isValidated {
 		return nil
 	}
-	if len(e.meta.Args) == 0 {
+	args, err := getArgs(e.base)(ctx)
+	if err != nil {
+		return err
+	}
+	if len(args) == 0 {
 		return errors.Errorf("arguments are required")
 	}
-	if e.meta.Cwd == "" {
+	cwd, err := getDir(e.base)(ctx)
+	if err != nil {
+		return err
+	}
+	if cwd == "" {
 		return errors.Errorf("working directory is required")
 	}
 	for _, m := range e.mounts {
 		if m.source != nil {
-			if err := m.source.Vertex().Validate(); err != nil {
+			if err := m.source.Vertex(ctx).Validate(ctx); err != nil {
 				return err
 			}
 		}
@@ -121,17 +124,22 @@ func (e *ExecOp) Validate() error {
 	return nil
 }
 
-func (e *ExecOp) Marshal(c *Constraints) (digest.Digest, []byte, *pb.OpMetadata, error) {
+func (e *ExecOp) Marshal(ctx context.Context, c *Constraints) (digest.Digest, []byte, *pb.OpMetadata, []*SourceLocation, error) {
 	if e.Cached(c) {
 		return e.Load()
 	}
-	if err := e.Validate(); err != nil {
-		return "", nil, nil, err
+	if err := e.Validate(ctx); err != nil {
+		return "", nil, nil, nil, err
 	}
 	// make sure mounts are sorted
 	sort.Slice(e.mounts, func(i, j int) bool {
 		return e.mounts[i].target < e.mounts[j].target
 	})
+
+	env, err := getEnv(e.base)(ctx)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
 
 	if len(e.ssh) > 0 {
 		for i, s := range e.ssh {
@@ -139,41 +147,75 @@ func (e *ExecOp) Marshal(c *Constraints) (digest.Digest, []byte, *pb.OpMetadata,
 				e.ssh[i].Target = fmt.Sprintf("/run/buildkit/ssh_agent.%d", i)
 			}
 		}
-		if _, ok := e.meta.Env.Get("SSH_AUTH_SOCK"); !ok {
-			e.meta.Env = e.meta.Env.AddOrReplace("SSH_AUTH_SOCK", e.ssh[0].Target)
+		if _, ok := env.Get("SSH_AUTH_SOCK"); !ok {
+			env = env.AddOrReplace("SSH_AUTH_SOCK", e.ssh[0].Target)
 		}
 	}
 	if c.Caps != nil {
 		if err := c.Caps.Supports(pb.CapExecMetaSetsDefaultPath); err != nil {
-			e.meta.Env = e.meta.Env.SetDefault("PATH", system.DefaultPathEnv)
+			env = env.SetDefault("PATH", system.DefaultPathEnv)
 		} else {
 			addCap(&e.constraints, pb.CapExecMetaSetsDefaultPath)
 		}
 	}
 
-	meta := &pb.Meta{
-		Args: e.meta.Args,
-		Env:  e.meta.Env.ToArray(),
-		Cwd:  e.meta.Cwd,
-		User: e.meta.User,
+	args, err := getArgs(e.base)(ctx)
+	if err != nil {
+		return "", nil, nil, nil, err
 	}
-	if len(e.meta.ExtraHosts) > 0 {
-		hosts := make([]*pb.HostIP, len(e.meta.ExtraHosts))
-		for i, h := range e.meta.ExtraHosts {
+
+	cwd, err := getDir(e.base)(ctx)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+
+	user, err := getUser(e.base)(ctx)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+
+	meta := &pb.Meta{
+		Args: args,
+		Env:  env.ToArray(),
+		Cwd:  cwd,
+		User: user,
+	}
+	extraHosts, err := getExtraHosts(e.base)(ctx)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	if len(extraHosts) > 0 {
+		hosts := make([]*pb.HostIP, len(extraHosts))
+		for i, h := range extraHosts {
 			hosts[i] = &pb.HostIP{Host: h.Host, IP: h.IP.String()}
 		}
 		meta.ExtraHosts = hosts
 	}
 
-	peo := &pb.ExecOp{
-		Meta:    meta,
-		Network: e.meta.Network,
+	network, err := getNetwork(e.base)(ctx)
+	if err != nil {
+		return "", nil, nil, nil, err
 	}
-	if e.meta.Network != NetModeSandbox {
+
+	security, err := getSecurity(e.base)(ctx)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+
+	peo := &pb.ExecOp{
+		Meta:     meta,
+		Network:  network,
+		Security: security,
+	}
+	if network != NetModeSandbox {
 		addCap(&e.constraints, pb.CapExecMetaNetwork)
 	}
 
-	if p := e.meta.ProxyEnv; p != nil {
+	if security != SecurityModeSandbox {
+		addCap(&e.constraints, pb.CapExecMetaSecurity)
+	}
+
+	if p := e.proxyEnv; p != nil {
 		peo.Meta.ProxyEnv = &pb.ProxyEnv{
 			HttpProxy:  p.HttpProxy,
 			HttpsProxy: p.HttpsProxy,
@@ -207,6 +249,14 @@ func (e *ExecOp) Marshal(c *Constraints) (digest.Digest, []byte, *pb.OpMetadata,
 		addCap(&e.constraints, pb.CapExecMountSSH)
 	}
 
+	if e.constraints.Platform == nil {
+		p, err := getPlatform(e.base)(ctx)
+		if err != nil {
+			return "", nil, nil, nil, err
+		}
+		e.constraints.Platform = p
+	}
+
 	pop, md := MarshalConstraints(c, &e.constraints)
 	pop.Op = &pb.Op_Exec{
 		Exec: peo,
@@ -217,11 +267,11 @@ func (e *ExecOp) Marshal(c *Constraints) (digest.Digest, []byte, *pb.OpMetadata,
 		inputIndex := pb.InputIndex(len(pop.Inputs))
 		if m.source != nil {
 			if m.tmpfs {
-				return "", nil, nil, errors.Errorf("tmpfs mounts must use scratch")
+				return "", nil, nil, nil, errors.Errorf("tmpfs mounts must use scratch")
 			}
-			inp, err := m.source.ToInput(c)
+			inp, err := m.source.ToInput(ctx, c)
 			if err != nil {
-				return "", nil, nil, err
+				return "", nil, nil, nil, err
 			}
 
 			newInput := true
@@ -242,7 +292,7 @@ func (e *ExecOp) Marshal(c *Constraints) (digest.Digest, []byte, *pb.OpMetadata,
 		}
 
 		outputIndex := pb.OutputIndex(-1)
-		if !m.readonly && m.cacheID == "" && !m.tmpfs {
+		if !m.noOutput && !m.readonly && m.cacheID == "" && !m.tmpfs {
 			outputIndex = pb.OutputIndex(outIndex)
 			outIndex++
 		}
@@ -306,9 +356,9 @@ func (e *ExecOp) Marshal(c *Constraints) (digest.Digest, []byte, *pb.OpMetadata,
 
 	dt, err := pop.Marshal()
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, nil, nil, err
 	}
-	e.Store(dt, md, c)
+	e.Store(dt, md, e.constraints.SourceLocations, c)
 	return e.Load()
 }
 
@@ -338,7 +388,7 @@ func (e *ExecOp) getMountIndexFn(m *mount) func() (pb.OutputIndex, error) {
 
 		i := 0
 		for _, m2 := range e.mounts {
-			if m2.readonly || m2.cacheID != "" {
+			if m2.noOutput || m2.readonly || m2.tmpfs || m2.cacheID != "" {
 				continue
 			}
 			if m == m2 {
@@ -379,6 +429,10 @@ func SourcePath(src string) MountOption {
 	}
 }
 
+func ForceNoOutput(m *mount) {
+	m.noOutput = true
+}
+
 func AsPersistentCacheDir(id string, sharing CacheMountSharingMode) MountOption {
 	return func(m *mount) {
 		m.cacheID = id
@@ -402,18 +456,20 @@ func (fn runOptionFunc) SetRunOption(ei *ExecInfo) {
 	fn(ei)
 }
 
-func Network(n pb.NetMode) RunOption {
-	return runOptionFunc(func(ei *ExecInfo) {
-		ei.State = network(n)(ei.State)
-	})
+func (fn StateOption) SetRunOption(ei *ExecInfo) {
+	ei.State = ei.State.With(fn)
 }
 
+var _ RunOption = StateOption(func(_ State) State { return State{} })
+
 func Shlex(str string) RunOption {
-	return Shlexf(str)
+	return runOptionFunc(func(ei *ExecInfo) {
+		ei.State = shlexf(str, false)(ei.State)
+	})
 }
 func Shlexf(str string, v ...interface{}) RunOption {
 	return runOptionFunc(func(ei *ExecInfo) {
-		ei.State = shlexf(str, v...)(ei.State)
+		ei.State = shlexf(str, true, v...)(ei.State)
 	})
 }
 
@@ -423,40 +479,9 @@ func Args(a []string) RunOption {
 	})
 }
 
-func AddEnv(key, value string) RunOption {
-	return AddEnvf(key, value)
-}
-
-func AddEnvf(key, value string, v ...interface{}) RunOption {
-	return runOptionFunc(func(ei *ExecInfo) {
-		ei.State = ei.State.AddEnvf(key, value, v...)
-	})
-}
-
-func User(str string) RunOption {
-	return runOptionFunc(func(ei *ExecInfo) {
-		ei.State = ei.State.User(str)
-	})
-}
-
-func Dir(str string) RunOption {
-	return Dirf(str)
-}
-func Dirf(str string, v ...interface{}) RunOption {
-	return runOptionFunc(func(ei *ExecInfo) {
-		ei.State = ei.State.Dirf(str, v...)
-	})
-}
-
 func AddExtraHost(host string, ip net.IP) RunOption {
 	return runOptionFunc(func(ei *ExecInfo) {
 		ei.State = ei.State.AddExtraHost(host, ip)
-	})
-}
-
-func Reset(s State) RunOption {
-	return runOptionFunc(func(ei *ExecInfo) {
-		ei.State = ei.State.Reset(s)
 	})
 }
 
@@ -622,4 +647,9 @@ const (
 	NetModeSandbox = pb.NetMode_UNSET
 	NetModeHost    = pb.NetMode_HOST
 	NetModeNone    = pb.NetMode_NONE
+)
+
+const (
+	SecurityModeInsecure = pb.SecurityMode_INSECURE
+	SecurityModeSandbox  = pb.SecurityMode_SANDBOX
 )

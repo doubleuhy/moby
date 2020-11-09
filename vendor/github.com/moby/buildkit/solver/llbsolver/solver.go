@@ -2,6 +2,7 @@ package llbsolver
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -10,17 +11,17 @@ import (
 	"github.com/moby/buildkit/client"
 	controlgateway "github.com/moby/buildkit/control/gateway"
 	"github.com/moby/buildkit/exporter"
+	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/frontend"
 	"github.com/moby/buildkit/frontend/gateway"
-	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/util/entitlements"
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 )
 
 const keyEntitlements = "llb.entitlements"
@@ -35,30 +36,28 @@ type ExporterRequest struct {
 type ResolveWorkerFunc func() (worker.Worker, error)
 
 type Solver struct {
-	workerController     *worker.Controller
-	solver               *solver.Solver
-	resolveWorker        ResolveWorkerFunc
-	frontends            map[string]frontend.Frontend
-	resolveCacheImporter remotecache.ResolveCacheImporterFunc
-	platforms            []specs.Platform
-	gatewayForwarder     *controlgateway.GatewayForwarder
+	workerController          *worker.Controller
+	solver                    *solver.Solver
+	resolveWorker             ResolveWorkerFunc
+	eachWorker                func(func(worker.Worker) error) error
+	frontends                 map[string]frontend.Frontend
+	resolveCacheImporterFuncs map[string]remotecache.ResolveCacheImporterFunc
+	gatewayForwarder          *controlgateway.GatewayForwarder
+	sm                        *session.Manager
+	entitlements              []string
 }
 
-func New(wc *worker.Controller, f map[string]frontend.Frontend, cache solver.CacheManager, resolveCI remotecache.ResolveCacheImporterFunc, gatewayForwarder *controlgateway.GatewayForwarder) (*Solver, error) {
+func New(wc *worker.Controller, f map[string]frontend.Frontend, cache solver.CacheManager, resolveCI map[string]remotecache.ResolveCacheImporterFunc, gatewayForwarder *controlgateway.GatewayForwarder, sm *session.Manager, ents []string) (*Solver, error) {
 	s := &Solver{
-		workerController:     wc,
-		resolveWorker:        defaultResolver(wc),
-		frontends:            f,
-		resolveCacheImporter: resolveCI,
-		gatewayForwarder:     gatewayForwarder,
+		workerController:          wc,
+		resolveWorker:             defaultResolver(wc),
+		eachWorker:                allWorkers(wc),
+		frontends:                 f,
+		resolveCacheImporterFuncs: resolveCI,
+		gatewayForwarder:          gatewayForwarder,
+		sm:                        sm,
+		entitlements:              ents,
 	}
-
-	// executing is currently only allowed on default worker
-	w, err := wc.GetDefault()
-	if err != nil {
-		return nil, err
-	}
-	s.platforms = w.Platforms()
 
 	s.solver = solver.NewSolver(solver.SolverOpt{
 		ResolveOpFunc: s.resolver(),
@@ -73,22 +72,23 @@ func (s *Solver) resolver() solver.ResolveOpFunc {
 		if err != nil {
 			return nil, err
 		}
-		return w.ResolveOp(v, s.Bridge(b))
+		return w.ResolveOp(v, s.Bridge(b), s.sm)
 	}
 }
 
 func (s *Solver) Bridge(b solver.Builder) frontend.FrontendLLBBridge {
 	return &llbBridge{
-		builder:              b,
-		frontends:            s.frontends,
-		resolveWorker:        s.resolveWorker,
-		resolveCacheImporter: s.resolveCacheImporter,
-		cms:                  map[string]solver.CacheManager{},
-		platforms:            s.platforms,
+		builder:                   b,
+		frontends:                 s.frontends,
+		resolveWorker:             s.resolveWorker,
+		eachWorker:                s.eachWorker,
+		resolveCacheImporterFuncs: s.resolveCacheImporterFuncs,
+		cms:                       map[string]solver.CacheManager{},
+		sm:                        s.sm,
 	}
 }
 
-func (s *Solver) Solve(ctx context.Context, id string, req frontend.SolveRequest, exp ExporterRequest, ent []entitlements.Entitlement) (*client.SolveResponse, error) {
+func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req frontend.SolveRequest, exp ExporterRequest, ent []entitlements.Entitlement) (*client.SolveResponse, error) {
 	j, err := s.solver.NewJob(id)
 	if err != nil {
 		return nil, err
@@ -96,17 +96,17 @@ func (s *Solver) Solve(ctx context.Context, id string, req frontend.SolveRequest
 
 	defer j.Discard()
 
-	set, err := entitlements.WhiteList(ent, supportedEntitlements())
+	set, err := entitlements.WhiteList(ent, supportedEntitlements(s.entitlements))
 	if err != nil {
 		return nil, err
 	}
 	j.SetValue(keyEntitlements, set)
 
-	j.SessionID = session.FromContext(ctx)
+	j.SessionID = sessionID
 
 	var res *frontend.Result
 	if s.gatewayForwarder != nil && req.Definition == nil && req.Frontend == "" {
-		fwd := gateway.NewBridgeForwarder(ctx, s.Bridge(j), s.workerController)
+		fwd := gateway.NewBridgeForwarder(ctx, s.Bridge(j), s.workerController, req.FrontendInputs, sessionID)
 		defer fwd.Discard()
 		if err := s.gatewayForwarder.RegisterBuild(ctx, id, fwd); err != nil {
 			return nil, err
@@ -124,21 +124,33 @@ func (s *Solver) Solve(ctx context.Context, id string, req frontend.SolveRequest
 			return nil, err
 		}
 	} else {
-		res, err = s.Bridge(j).Solve(ctx, req)
+		res, err = s.Bridge(j).Solve(ctx, req, sessionID)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	defer func() {
-		res.EachRef(func(ref solver.CachedResult) error {
+		res.EachRef(func(ref solver.ResultProxy) error {
 			go ref.Release(context.TODO())
 			return nil
 		})
 	}()
 
+	eg, ctx2 := errgroup.WithContext(ctx)
+	res.EachRef(func(ref solver.ResultProxy) error {
+		eg.Go(func() error {
+			_, err := ref.Result(ctx2)
+			return err
+		})
+		return nil
+	})
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+
 	var exporterResponse map[string]string
-	if exp := exp.Exporter; exp != nil {
+	if e := exp.Exporter; e != nil {
 		inp := exporter.Source{
 			Metadata: res.Metadata,
 		}
@@ -146,11 +158,23 @@ func (s *Solver) Solve(ctx context.Context, id string, req frontend.SolveRequest
 			inp.Metadata = make(map[string][]byte)
 		}
 		if res := res.Ref; res != nil {
-			workerRef, ok := res.Sys().(*worker.WorkerRef)
+			r, err := res.Result(ctx)
+			if err != nil {
+				return nil, err
+			}
+			workerRef, ok := r.Sys().(*worker.WorkerRef)
 			if !ok {
-				return nil, errors.Errorf("invalid reference: %T", res.Sys())
+				return nil, errors.Errorf("invalid reference: %T", r.Sys())
 			}
 			inp.Ref = workerRef.ImmutableRef
+
+			dt, err := inlineCache(ctx, exp.CacheExporter, r)
+			if err != nil {
+				return nil, err
+			}
+			if dt != nil {
+				inp.Metadata[exptypes.ExporterInlineCache] = dt
+			}
 		}
 		if res.Refs != nil {
 			m := make(map[string]cache.ImmutableRef, len(res.Refs))
@@ -158,30 +182,47 @@ func (s *Solver) Solve(ctx context.Context, id string, req frontend.SolveRequest
 				if res == nil {
 					m[k] = nil
 				} else {
-					workerRef, ok := res.Sys().(*worker.WorkerRef)
+					r, err := res.Result(ctx)
+					if err != nil {
+						return nil, err
+					}
+					workerRef, ok := r.Sys().(*worker.WorkerRef)
 					if !ok {
-						return nil, errors.Errorf("invalid reference: %T", res.Sys())
+						return nil, errors.Errorf("invalid reference: %T", r.Sys())
 					}
 					m[k] = workerRef.ImmutableRef
+
+					dt, err := inlineCache(ctx, exp.CacheExporter, r)
+					if err != nil {
+						return nil, err
+					}
+					if dt != nil {
+						inp.Metadata[fmt.Sprintf("%s/%s", exptypes.ExporterInlineCache, k)] = dt
+					}
 				}
 			}
 			inp.Refs = m
 		}
 
-		if err := inVertexContext(j.Context(ctx), exp.Name(), "", func(ctx context.Context) error {
-			exporterResponse, err = exp.Export(ctx, inp)
+		if err := inBuilderContext(ctx, j, e.Name(), "", func(ctx context.Context, _ session.Group) error {
+			exporterResponse, err = e.Export(ctx, inp, j.SessionID)
 			return err
 		}); err != nil {
 			return nil, err
 		}
 	}
 
+	var cacheExporterResponse map[string]string
 	if e := exp.CacheExporter; e != nil {
-		if err := inVertexContext(j.Context(ctx), "exporting cache", "", func(ctx context.Context) error {
+		if err := inBuilderContext(ctx, j, "exporting cache", "", func(ctx context.Context, _ session.Group) error {
 			prepareDone := oneOffProgress(ctx, "preparing build cache for export")
-			if err := res.EachRef(func(res solver.CachedResult) error {
+			if err := res.EachRef(func(res solver.ResultProxy) error {
+				r, err := res.Result(ctx)
+				if err != nil {
+					return err
+				}
 				// all keys have same export chain so exporting others is not needed
-				_, err := res.CacheKeys()[0].Exporter.ExportTo(ctx, e, solver.CacheExportOpt{
+				_, err = r.CacheKeys()[0].Exporter.ExportTo(ctx, e, solver.CacheExportOpt{
 					Convert: workerRefConverter,
 					Mode:    exp.CacheExportMode,
 				})
@@ -190,7 +231,8 @@ func (s *Solver) Solve(ctx context.Context, id string, req frontend.SolveRequest
 				return prepareDone(err)
 			}
 			prepareDone(nil)
-			return e.Finalize(ctx)
+			cacheExporterResponse, err = e.Finalize(ctx)
+			return err
 		}); err != nil {
 			return nil, err
 		}
@@ -205,10 +247,46 @@ func (s *Solver) Solve(ctx context.Context, id string, req frontend.SolveRequest
 			exporterResponse[k] = string(v)
 		}
 	}
+	for k, v := range cacheExporterResponse {
+		if strings.HasPrefix(k, "cache.") {
+			exporterResponse[k] = v
+		}
+	}
 
 	return &client.SolveResponse{
 		ExporterResponse: exporterResponse,
 	}, nil
+}
+
+func inlineCache(ctx context.Context, e remotecache.Exporter, res solver.CachedResult) ([]byte, error) {
+	if efl, ok := e.(interface {
+		ExportForLayers([]digest.Digest) ([]byte, error)
+	}); ok {
+		workerRef, ok := res.Sys().(*worker.WorkerRef)
+		if !ok {
+			return nil, errors.Errorf("invalid reference: %T", res.Sys())
+		}
+
+		remote, err := workerRef.Worker.GetRemote(ctx, workerRef.ImmutableRef, true)
+		if err != nil || remote == nil {
+			return nil, nil
+		}
+
+		digests := make([]digest.Digest, 0, len(remote.Descriptors))
+		for _, desc := range remote.Descriptors {
+			digests = append(digests, desc.Digest)
+		}
+
+		if _, err := res.CacheKeys()[0].Exporter.ExportTo(ctx, e, solver.CacheExportOpt{
+			Convert: workerRefConverter,
+			Mode:    solver.CacheExportModeMin,
+		}); err != nil {
+			return nil, err
+		}
+
+		return efl.ExportForLayers(digests)
+	}
+	return nil, nil
 }
 
 func (s *Solver) Status(ctx context.Context, id string, statusChan chan *client.SolveStatus) error {
@@ -223,6 +301,20 @@ func (s *Solver) Status(ctx context.Context, id string, statusChan chan *client.
 func defaultResolver(wc *worker.Controller) ResolveWorkerFunc {
 	return func() (worker.Worker, error) {
 		return wc.GetDefault()
+	}
+}
+func allWorkers(wc *worker.Controller) func(func(w worker.Worker) error) error {
+	return func(f func(worker.Worker) error) error {
+		all, err := wc.List()
+		if err != nil {
+			return err
+		}
+		for _, w := range all {
+			if err := f(w); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 }
 
@@ -243,20 +335,22 @@ func oneOffProgress(ctx context.Context, id string) func(err error) error {
 	}
 }
 
-func inVertexContext(ctx context.Context, name, id string, f func(ctx context.Context) error) error {
+func inBuilderContext(ctx context.Context, b solver.Builder, name, id string, f func(ctx context.Context, g session.Group) error) error {
 	if id == "" {
-		id = identity.NewID()
+		id = name
 	}
 	v := client.Vertex{
 		Digest: digest.FromBytes([]byte(id)),
 		Name:   name,
 	}
-	pw, _, ctx := progress.FromContext(ctx, progress.WithMetadata("vertex", v.Digest))
-	notifyStarted(ctx, &v, false)
-	defer pw.Close()
-	err := f(ctx)
-	notifyCompleted(ctx, &v, err, false)
-	return err
+	return b.InContext(ctx, func(ctx context.Context, g session.Group) error {
+		pw, _, ctx := progress.FromContext(ctx, progress.WithMetadata("vertex", v.Digest))
+		notifyStarted(ctx, &v, false)
+		defer pw.Close()
+		err := f(ctx, g)
+		notifyCompleted(ctx, &v, err, false)
+		return err
+	})
 }
 
 func notifyStarted(ctx context.Context, v *client.Vertex, cached bool) {
@@ -284,12 +378,15 @@ func notifyCompleted(ctx context.Context, v *client.Vertex, err error, cached bo
 	pw.Write(v.Digest.String(), *v)
 }
 
-var AllowNetworkHostUnstable = false // TODO: enable in constructor
-
-func supportedEntitlements() []entitlements.Entitlement {
+func supportedEntitlements(ents []string) []entitlements.Entitlement {
 	out := []entitlements.Entitlement{} // nil means no filter
-	if AllowNetworkHostUnstable {
-		out = append(out, entitlements.EntitlementNetworkHost)
+	for _, e := range ents {
+		if e == string(entitlements.EntitlementNetworkHost) {
+			out = append(out, entitlements.EntitlementNetworkHost)
+		}
+		if e == string(entitlements.EntitlementSecurityInsecure) {
+			out = append(out, entitlements.EntitlementSecurityInsecure)
+		}
 	}
 	return out
 }

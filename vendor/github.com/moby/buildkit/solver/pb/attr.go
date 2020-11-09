@@ -2,6 +2,8 @@ package pb
 
 const AttrKeepGitDir = "git.keepgitdir"
 const AttrFullRemoteURL = "git.fullurl"
+const AttrAuthHeaderSecret = "git.authheadersecret"
+const AttrAuthTokenSecret = "git.authtokensecret"
 const AttrLocalSessionID = "local.session"
 const AttrLocalUniqueID = "local.unique"
 const AttrIncludePatterns = "local.includepattern"
@@ -21,3 +23,5 @@ const AttrImageResolveModeDefault = "default"
 const AttrImageResolveModeForcePull = "pull"
 const AttrImageResolveModePreferLocal = "local"
 const AttrImageRecordType = "image.recordtype"
+
+type IsFileAction = isFileAction_Action

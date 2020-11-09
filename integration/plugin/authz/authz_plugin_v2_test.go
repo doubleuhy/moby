@@ -16,8 +16,8 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/integration/internal/container"
 	"github.com/docker/docker/integration/internal/requirement"
-	"gotest.tools/assert"
-	"gotest.tools/skip"
+	"gotest.tools/v3/assert"
+	"gotest.tools/v3/skip"
 )
 
 var (
@@ -55,7 +55,7 @@ func TestAuthZPluginV2AllowNonVolumeRequest(t *testing.T) {
 	d.LoadBusybox(t)
 
 	// Ensure docker run command and accompanying docker ps are successful
-	cID := container.Run(t, ctx, c)
+	cID := container.Run(ctx, t, c)
 
 	_, err = c.ContainerInspect(ctx, cID)
 	assert.NilError(t, err)

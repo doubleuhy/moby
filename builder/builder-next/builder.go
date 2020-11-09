@@ -5,17 +5,19 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/platforms"
+	"github.com/containerd/containerd/remotes/docker"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/builder"
 	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/daemon/images"
+	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/docker/docker/pkg/system"
 	"github.com/docker/libnetwork"
@@ -24,12 +26,11 @@ import (
 	"github.com/moby/buildkit/control"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
-	"github.com/moby/buildkit/solver/llbsolver"
 	"github.com/moby/buildkit/util/entitlements"
-	"github.com/moby/buildkit/util/resolver"
 	"github.com/moby/buildkit/util/tracing"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
 	grpcmetadata "google.golang.org/grpc/metadata"
 )
 
@@ -62,10 +63,6 @@ var cacheFields = map[string]bool{
 	"immutable": false,
 }
 
-func init() {
-	llbsolver.AllowNetworkHostUnstable = true
-}
-
 // Opt is option struct required for creating the builder
 type Opt struct {
 	SessionManager      *session.Manager
@@ -73,9 +70,11 @@ type Opt struct {
 	Dist                images.DistributionServices
 	NetworkController   libnetwork.NetworkController
 	DefaultCgroupParent string
-	ResolverOpt         resolver.ResolveOptionsFunc
+	RegistryHosts       docker.RegistryHosts
 	BuilderConfig       config.BuilderConfig
 	Rootless            bool
+	IdentityMapping     *idtools.IdentityMapping
+	DNSConfig           config.DNSConfig
 }
 
 // Builder can build using BuildKit backend
@@ -91,6 +90,10 @@ type Builder struct {
 func New(opt Opt) (*Builder, error) {
 	reqHandler := newReqBodyHandler(tracing.DefaultTransport)
 
+	if opt.IdentityMapping != nil && opt.IdentityMapping.Empty() {
+		opt.IdentityMapping = nil
+	}
+
 	c, err := newController(reqHandler, opt)
 	if err != nil {
 		return nil, err
@@ -101,6 +104,11 @@ func New(opt Opt) (*Builder, error) {
 		jobs:           map[string]*buildJob{},
 	}
 	return b, nil
+}
+
+// RegisterGRPC registers controller to the grpc server.
+func (b *Builder) RegisterGRPC(s *grpc.Server) {
+	b.controller.Register(s)
 }
 
 // Cancel cancels a build using ID
@@ -232,7 +240,9 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 		}
 
 		defer func() {
+			b.mu.Lock()
 			delete(b.jobs, buildID)
+			b.mu.Unlock()
 		}()
 	}
 
@@ -312,19 +322,45 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 	}
 	frontendAttrs["add-hosts"] = extraHosts
 
+	exporterName := ""
 	exporterAttrs := map[string]string{}
 
-	if len(opt.Options.Tags) > 0 {
-		exporterAttrs["name"] = strings.Join(opt.Options.Tags, ",")
+	if len(opt.Options.Outputs) > 1 {
+		return nil, errors.Errorf("multiple outputs not supported")
+	} else if len(opt.Options.Outputs) == 0 {
+		exporterName = "moby"
+	} else {
+		// cacheonly is a special type for triggering skipping all exporters
+		if opt.Options.Outputs[0].Type != "cacheonly" {
+			exporterName = opt.Options.Outputs[0].Type
+			exporterAttrs = opt.Options.Outputs[0].Attrs
+		}
+	}
+
+	if exporterName == "moby" {
+		if len(opt.Options.Tags) > 0 {
+			exporterAttrs["name"] = strings.Join(opt.Options.Tags, ",")
+		}
+	}
+
+	cache := controlapi.CacheOptions{}
+
+	if inlineCache := opt.Options.BuildArgs["BUILDKIT_INLINE_CACHE"]; inlineCache != nil {
+		if b, err := strconv.ParseBool(*inlineCache); err == nil && b {
+			cache.Exports = append(cache.Exports, &controlapi.CacheOptionsEntry{
+				Type: "inline",
+			})
+		}
 	}
 
 	req := &controlapi.SolveRequest{
 		Ref:           id,
-		Exporter:      "moby",
+		Exporter:      exporterName,
 		ExporterAttrs: exporterAttrs,
 		Frontend:      "dockerfile.v0",
 		FrontendAttrs: frontendAttrs,
 		Session:       opt.Options.SessionID,
+		Cache:         cache,
 	}
 
 	if opt.Options.NetworkMode == "host" {
@@ -339,6 +375,9 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 		resp, err := b.controller.Solve(ctx, req)
 		if err != nil {
 			return err
+		}
+		if exporterName != "moby" {
+			return nil
 		}
 		id, ok := resp.ExporterResponse["containerimage.digest"]
 		if !ok {
@@ -428,14 +467,6 @@ func (sp *pruneProxy) SendMsg(m interface{}) error {
 		sp.ch <- sr
 	}
 	return nil
-}
-
-type contentStoreNoLabels struct {
-	content.Store
-}
-
-func (c *contentStoreNoLabels) Update(ctx context.Context, info content.Info, fieldpaths ...string) (content.Info, error) {
-	return content.Info{}, nil
 }
 
 type wrapRC struct {
@@ -559,7 +590,7 @@ func toBuildkitPruneInfo(opts types.BuildCachePruneOptions) (client.PruneInfo, e
 
 	bkFilter := make([]string, 0, opts.Filters.Len())
 	for cacheField := range cacheFields {
-		if opts.Filters.Include(cacheField) {
+		if opts.Filters.Contains(cacheField) {
 			values := opts.Filters.Get(cacheField)
 			switch len(values) {
 			case 0:

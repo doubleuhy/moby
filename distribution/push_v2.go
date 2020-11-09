@@ -2,9 +2,10 @@ package distribution // import "github.com/docker/docker/distribution"
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
+	"os"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -23,7 +24,8 @@ import (
 	"github.com/docker/docker/pkg/progress"
 	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/docker/registry"
-	"github.com/opencontainers/go-digest"
+	digest "github.com/opencontainers/go-digest"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
@@ -93,7 +95,7 @@ func (p *v2Pusher) pushV2Repository(ctx context.Context) (err error) {
 		return errors.New("cannot push a digest reference")
 	}
 
-	// Pull all tags
+	// Push all tags
 	pushed := 0
 	for _, association := range p.config.ReferenceStore.ReferencesByName(p.ref) {
 		if namedTagged, isNamedTagged := association.Ref.(reference.NamedTagged); isNamedTagged {
@@ -180,8 +182,44 @@ func (p *v2Pusher) pushV2Tag(ctx context.Context, ref reference.NamedTagged, id 
 
 	putOptions := []distribution.ManifestServiceOption{distribution.WithTag(ref.Tag())}
 	if _, err = manSvc.Put(ctx, manifest, putOptions...); err != nil {
-		logrus.Warnf("failed to upload schema2 manifest: %v", err)
-		return err
+		if runtime.GOOS == "windows" || p.config.TrustKey == nil || p.config.RequireSchema2 {
+			logrus.Warnf("failed to upload schema2 manifest: %v", err)
+			return err
+		}
+
+		// This is a temporary environment variables used in CI to allow pushing
+		// manifest v2 schema 1 images to test-registries used for testing *pulling*
+		// these images.
+		if os.Getenv("DOCKER_ALLOW_SCHEMA1_PUSH_DONOTUSE") == "" {
+			if err.Error() == "tag invalid" {
+				msg := "[DEPRECATED] support for pushing manifest v2 schema1 images has been removed. More information at https://docs.docker.com/registry/spec/deprecated-schema-v1/"
+				logrus.WithError(err).Error(msg)
+				return errors.Wrap(err, msg)
+			}
+			return err
+		}
+
+		logrus.Warnf("failed to upload schema2 manifest: %v - falling back to schema1", err)
+
+		// Note: this fallback is deprecated, see log messages below
+		manifestRef, err := reference.WithTag(p.repo.Named(), ref.Tag())
+		if err != nil {
+			return err
+		}
+		builder = schema1.NewConfigManifestBuilder(p.repo.Blobs(ctx), p.config.TrustKey, manifestRef, imgConfig)
+		manifest, err = manifestFromBuilder(ctx, builder, descriptors)
+		if err != nil {
+			return err
+		}
+
+		if _, err = manSvc.Put(ctx, manifest, putOptions...); err != nil {
+			return err
+		}
+
+		// schema2 failed but schema1 succeeded
+		msg := fmt.Sprintf("[DEPRECATION NOTICE] support for pushing manifest v2 schema1 images will be removed in an upcoming release. Please contact admins of the %s registry NOW to avoid future disruption. More information at https://docs.docker.com/registry/spec/deprecated-schema-v1/", reference.Domain(ref))
+		logrus.Warn(msg)
+		progress.Message(p.config.ProgressOutput, "", msg)
 	}
 
 	var canonicalManifest []byte
@@ -649,7 +687,6 @@ func (bla byLikeness) Swap(i, j int) {
 }
 func (bla byLikeness) Len() int { return len(bla.arr) }
 
-// nolint: interfacer
 func sortV2MetadataByLikenessAndAge(repoInfo reference.Named, hmacKey []byte, marr []metadata.V2Metadata) {
 	// reverse the metadata array to shift the newest entries to the beginning
 	for i := 0; i < len(marr)/2; i++ {

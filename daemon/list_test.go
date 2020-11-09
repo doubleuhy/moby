@@ -11,10 +11,10 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/image"
-	"github.com/opencontainers/go-digest"
-	"github.com/pborman/uuid"
-	"gotest.tools/assert"
-	is "gotest.tools/assert/cmp"
+	"github.com/google/uuid"
+	digest "github.com/opencontainers/go-digest"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 var root string
@@ -36,7 +36,7 @@ func TestMain(m *testing.M) {
 func setupContainerWithName(t *testing.T, name string, daemon *Daemon) *container.Container {
 	t.Helper()
 	var (
-		id              = uuid.New()
+		id              = uuid.New().String()
 		computedImageID = digest.FromString(id)
 		cRoot           = filepath.Join(root, id)
 	)
@@ -69,8 +69,8 @@ func setupContainerWithName(t *testing.T, name string, daemon *Daemon) *containe
 }
 
 func containerListContainsName(containers []*types.Container, name string) bool {
-	for _, container := range containers {
-		for _, containerName := range container.Names {
+	for _, ctr := range containers {
+		for _, containerName := range ctr.Names {
 			if containerName == name {
 				return true
 			}

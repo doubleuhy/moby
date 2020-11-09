@@ -44,15 +44,12 @@ func (s *systemRouter) pingHandler(ctx context.Context, w http.ResponseWriter, r
 }
 
 func (s *systemRouter) getInfo(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
-	info, err := s.backend.SystemInfo()
-	if err != nil {
-		return err
-	}
+	info := s.backend.SystemInfo()
+
 	if s.cluster != nil {
 		info.Swarm = s.cluster.Info()
+		info.Warnings = append(info.Warnings, info.Swarm.Warnings...)
 	}
-
-	info.Builder = build.BuilderVersion(*s.features)
 
 	if versions.LessThan(httputils.VersionFromContext(ctx), "1.25") {
 		// TODO: handle this conversion in engine-api
@@ -102,16 +99,6 @@ func (s *systemRouter) getDiskUsage(ctx context.Context, w http.ResponseWriter, 
 		return err
 	})
 
-	var builderSize int64 // legacy
-	eg.Go(func() error {
-		var err error
-		builderSize, err = s.fscache.DiskUsage(ctx)
-		if err != nil {
-			return pkgerrors.Wrap(err, "error getting fscache build cache usage")
-		}
-		return nil
-	})
-
 	var buildCache []*types.BuildCache
 	eg.Go(func() error {
 		var err error
@@ -126,6 +113,7 @@ func (s *systemRouter) getDiskUsage(ctx context.Context, w http.ResponseWriter, 
 		return err
 	}
 
+	var builderSize int64
 	for _, b := range buildCache {
 		builderSize += b.Size
 	}
@@ -175,7 +163,9 @@ func (s *systemRouter) getEvents(ctx context.Context, w http.ResponseWriter, r *
 
 		if !onlyPastEvents {
 			dur := until.Sub(now)
-			timeout = time.After(dur)
+			timer := time.NewTimer(dur)
+			defer timer.Stop()
+			timeout = timer.C
 		}
 	}
 

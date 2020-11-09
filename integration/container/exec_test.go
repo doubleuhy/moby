@@ -10,9 +10,9 @@ import (
 	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/api/types/versions"
 	"github.com/docker/docker/integration/internal/container"
-	"gotest.tools/assert"
-	is "gotest.tools/assert/cmp"
-	"gotest.tools/skip"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/skip"
 )
 
 // TestExecWithCloseStdin adds case for moby#37870 issue.
@@ -24,7 +24,7 @@ func TestExecWithCloseStdin(t *testing.T) {
 	client := testEnv.APIClient()
 
 	// run top with detached mode
-	cID := container.Run(t, ctx, client)
+	cID := container.Run(ctx, t, client)
 
 	expected := "closeIO"
 	execResp, err := client.ContainerExecCreate(ctx, cID,
@@ -53,7 +53,7 @@ func TestExecWithCloseStdin(t *testing.T) {
 		resCh  = make(chan struct {
 			content string
 			err     error
-		})
+		}, 1)
 	)
 
 	go func() {
@@ -85,12 +85,11 @@ func TestExecWithCloseStdin(t *testing.T) {
 
 func TestExec(t *testing.T) {
 	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.35"), "broken in earlier versions")
-	skip.If(t, testEnv.OSType == "windows", "FIXME. Probably needs to wait for container to be in running state.")
 	defer setupTest(t)()
 	ctx := context.Background()
 	client := testEnv.APIClient()
 
-	cID := container.Run(t, ctx, client, container.WithTty(true), container.WithWorkingDir("/root"))
+	cID := container.Run(ctx, t, client, container.WithTty(true), container.WithWorkingDir("/root"))
 
 	id, err := client.ContainerExecCreate(ctx, cID,
 		types.ExecConfig{
@@ -101,6 +100,10 @@ func TestExec(t *testing.T) {
 		},
 	)
 	assert.NilError(t, err)
+
+	inspect, err := client.ContainerExecInspect(ctx, id.ID)
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(inspect.ExecID, id.ID))
 
 	resp, err := client.ContainerExecAttach(ctx, id.ID,
 		types.ExecStartCheck{
@@ -114,6 +117,25 @@ func TestExec(t *testing.T) {
 	assert.NilError(t, err)
 	out := string(r)
 	assert.NilError(t, err)
-	assert.Assert(t, is.Contains(out, "PWD=/tmp"), "exec command not running in expected /tmp working directory")
+	expected := "PWD=/tmp"
+	if testEnv.OSType == "windows" {
+		expected = "PWD=C:/tmp"
+	}
+	assert.Assert(t, is.Contains(out, expected), "exec command not running in expected /tmp working directory")
 	assert.Assert(t, is.Contains(out, "FOO=BAR"), "exec command not running with expected environment variable FOO")
+}
+
+func TestExecUser(t *testing.T) {
+	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.39"), "broken in earlier versions")
+	skip.If(t, testEnv.OSType == "windows", "FIXME. Probably needs to wait for container to be in running state.")
+	defer setupTest(t)()
+	ctx := context.Background()
+	client := testEnv.APIClient()
+
+	cID := container.Run(ctx, t, client, container.WithTty(true), container.WithUser("1:1"))
+
+	result, err := container.Exec(ctx, client, cID, []string{"id"})
+	assert.NilError(t, err)
+
+	assert.Assert(t, is.Contains(result.Stdout(), "uid=1(daemon) gid=1(daemon)"), "exec command not running as uid/gid 1")
 }

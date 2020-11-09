@@ -2,6 +2,7 @@ package service // import "github.com/docker/docker/volume/service"
 
 import (
 	"context"
+	"strconv"
 	"sync/atomic"
 
 	"github.com/docker/docker/api/types"
@@ -63,7 +64,7 @@ func (s *VolumesService) GetDriverList() []string {
 // When whatever is going to reference this volume is removed the caller should defeference the volume by calling `Release`.
 func (s *VolumesService) Create(ctx context.Context, name, driverName string, opts ...opts.CreateOption) (*types.Volume, error) {
 	if name == "" {
-		name = stringid.GenerateNonCryptoID()
+		name = stringid.GenerateRandomID()
 	}
 	v, err := s.vs.Create(ctx, name, driverName, opts...)
 	if err != nil {
@@ -238,6 +239,9 @@ func (s *VolumesService) Prune(ctx context.Context, filter filters.Args) (*types
 		rep.SpaceReclaimed += uint64(vSize)
 		rep.VolumesDeleted = append(rep.VolumesDeleted, v.Name())
 	}
+	s.eventLogger.LogVolumeEvent("", "prune", map[string]string{
+		"reclaimed": strconv.FormatInt(int64(rep.SpaceReclaimed), 10),
+	})
 	return rep, nil
 }
 

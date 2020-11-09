@@ -33,8 +33,8 @@ import (
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/filters"
 	"github.com/containerd/containerd/log"
+	"github.com/sirupsen/logrus"
 
-	"github.com/containerd/continuity"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -92,7 +92,11 @@ func NewLabeledStore(root string, ls LabelStore) (content.Store, error) {
 }
 
 func (s *store) Info(ctx context.Context, dgst digest.Digest) (content.Info, error) {
-	p := s.blobPath(dgst)
+	p, err := s.blobPath(dgst)
+	if err != nil {
+		return content.Info{}, errors.Wrapf(err, "calculating blob info path")
+	}
+
 	fi, err := os.Stat(p)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -123,7 +127,10 @@ func (s *store) info(dgst digest.Digest, fi os.FileInfo, labels map[string]strin
 
 // ReaderAt returns an io.ReaderAt for the blob.
 func (s *store) ReaderAt(ctx context.Context, desc ocispec.Descriptor) (content.ReaderAt, error) {
-	p := s.blobPath(desc.Digest)
+	p, err := s.blobPath(desc.Digest)
+	if err != nil {
+		return nil, errors.Wrapf(err, "calculating blob path for ReaderAt")
+	}
 	fi, err := os.Stat(p)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -150,7 +157,12 @@ func (s *store) ReaderAt(ctx context.Context, desc ocispec.Descriptor) (content.
 // While this is safe to do concurrently, safe exist-removal logic must hold
 // some global lock on the store.
 func (s *store) Delete(ctx context.Context, dgst digest.Digest) error {
-	if err := os.RemoveAll(s.blobPath(dgst)); err != nil {
+	bp, err := s.blobPath(dgst)
+	if err != nil {
+		return errors.Wrapf(err, "calculating blob path for delete")
+	}
+
+	if err := os.RemoveAll(bp); err != nil {
 		if !os.IsNotExist(err) {
 			return err
 		}
@@ -166,7 +178,11 @@ func (s *store) Update(ctx context.Context, info content.Info, fieldpaths ...str
 		return content.Info{}, errors.Wrapf(errdefs.ErrFailedPrecondition, "update not supported on immutable content store")
 	}
 
-	p := s.blobPath(info.Digest)
+	p, err := s.blobPath(info.Digest)
+	if err != nil {
+		return content.Info{}, errors.Wrapf(err, "calculating blob path for update")
+	}
+
 	fi, err := os.Stat(p)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -477,13 +493,45 @@ func (s *store) Writer(ctx context.Context, opts ...content.WriterOpt) (content.
 	return w, nil // lock is now held by w.
 }
 
+func (s *store) resumeStatus(ref string, total int64, digester digest.Digester) (content.Status, error) {
+	path, _, data := s.ingestPaths(ref)
+	status, err := s.status(path)
+	if err != nil {
+		return status, errors.Wrap(err, "failed reading status of resume write")
+	}
+	if ref != status.Ref {
+		// NOTE(stevvooe): This is fairly catastrophic. Either we have some
+		// layout corruption or a hash collision for the ref key.
+		return status, errors.Wrapf(err, "ref key does not match: %v != %v", ref, status.Ref)
+	}
+
+	if total > 0 && status.Total > 0 && total != status.Total {
+		return status, errors.Errorf("provided total differs from status: %v != %v", total, status.Total)
+	}
+
+	// TODO(stevvooe): slow slow slow!!, send to goroutine or use resumable hashes
+	fp, err := os.Open(data)
+	if err != nil {
+		return status, err
+	}
+
+	p := bufPool.Get().(*[]byte)
+	status.Offset, err = io.CopyBuffer(digester.Hash(), fp, *p)
+	bufPool.Put(p)
+	fp.Close()
+	return status, err
+}
+
 // writer provides the main implementation of the Writer method. The caller
 // must hold the lock correctly and release on error if there is a problem.
 func (s *store) writer(ctx context.Context, ref string, total int64, expected digest.Digest) (content.Writer, error) {
 	// TODO(stevvooe): Need to actually store expected here. We have
 	// code in the service that shouldn't be dealing with this.
 	if expected != "" {
-		p := s.blobPath(expected)
+		p, err := s.blobPath(expected)
+		if err != nil {
+			return nil, errors.Wrap(err, "calculating expected blob path for writer")
+		}
 		if _, err := os.Stat(p); err == nil {
 			return nil, errors.Wrapf(errdefs.ErrAlreadyExists, "content %v", expected)
 		}
@@ -498,45 +546,25 @@ func (s *store) writer(ctx context.Context, ref string, total int64, expected di
 		updatedAt time.Time
 	)
 
+	foundValidIngest := false
 	// ensure that the ingest path has been created.
 	if err := os.Mkdir(path, 0755); err != nil {
 		if !os.IsExist(err) {
 			return nil, err
 		}
-
-		status, err := s.status(path)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed reading status of resume write")
+		status, err := s.resumeStatus(ref, total, digester)
+		if err == nil {
+			foundValidIngest = true
+			updatedAt = status.UpdatedAt
+			startedAt = status.StartedAt
+			total = status.Total
+			offset = status.Offset
+		} else {
+			logrus.Infof("failed to resume the status from path %s: %s. will recreate them", path, err.Error())
 		}
+	}
 
-		if ref != status.Ref {
-			// NOTE(stevvooe): This is fairly catastrophic. Either we have some
-			// layout corruption or a hash collision for the ref key.
-			return nil, errors.Wrapf(err, "ref key does not match: %v != %v", ref, status.Ref)
-		}
-
-		if total > 0 && status.Total > 0 && total != status.Total {
-			return nil, errors.Errorf("provided total differs from status: %v != %v", total, status.Total)
-		}
-
-		// TODO(stevvooe): slow slow slow!!, send to goroutine or use resumable hashes
-		fp, err := os.Open(data)
-		if err != nil {
-			return nil, err
-		}
-
-		p := bufPool.Get().(*[]byte)
-		offset, err = io.CopyBuffer(digester.Hash(), fp, *p)
-		bufPool.Put(p)
-		fp.Close()
-		if err != nil {
-			return nil, err
-		}
-
-		updatedAt = status.UpdatedAt
-		startedAt = status.StartedAt
-		total = status.Total
-	} else {
+	if !foundValidIngest {
 		startedAt = time.Now()
 		updatedAt = startedAt
 
@@ -546,11 +574,11 @@ func (s *store) writer(ctx context.Context, ref string, total int64, expected di
 			return nil, err
 		}
 
-		if writeTimestampFile(filepath.Join(path, "startedat"), startedAt); err != nil {
+		if err := writeTimestampFile(filepath.Join(path, "startedat"), startedAt); err != nil {
 			return nil, err
 		}
 
-		if writeTimestampFile(filepath.Join(path, "updatedat"), startedAt); err != nil {
+		if err := writeTimestampFile(filepath.Join(path, "updatedat"), startedAt); err != nil {
 			return nil, err
 		}
 
@@ -598,11 +626,17 @@ func (s *store) Abort(ctx context.Context, ref string) error {
 	return nil
 }
 
-func (s *store) blobPath(dgst digest.Digest) string {
-	return filepath.Join(s.root, "blobs", dgst.Algorithm().String(), dgst.Hex())
+func (s *store) blobPath(dgst digest.Digest) (string, error) {
+	if err := dgst.Validate(); err != nil {
+		return "", errors.Wrapf(errdefs.ErrInvalidArgument, "cannot calculate blob path from invalid digest: %v", err)
+	}
+
+	return filepath.Join(s.root, "blobs", dgst.Algorithm().String(), dgst.Hex()), nil
 }
 
 func (s *store) ingestRoot(ref string) string {
+	// we take a digest of the ref to keep the ingest paths constant length.
+	// Note that this is not the current or potential digest of incoming content.
 	dgst := digest.FromString(ref)
 	return filepath.Join(s.root, "ingest", dgst.Hex())
 }
@@ -651,6 +685,19 @@ func writeTimestampFile(p string, t time.Time) error {
 	if err != nil {
 		return err
 	}
+	return atomicWrite(p, b, 0666)
+}
 
-	return continuity.AtomicWriteFile(p, b, 0666)
+func atomicWrite(path string, data []byte, mode os.FileMode) error {
+	tmp := fmt.Sprintf("%s.tmp", path)
+	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC|os.O_SYNC, mode)
+	if err != nil {
+		return errors.Wrap(err, "create tmp file")
+	}
+	_, err = f.Write(data)
+	f.Close()
+	if err != nil {
+		return errors.Wrap(err, "write atomic data")
+	}
+	return os.Rename(tmp, path)
 }

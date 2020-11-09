@@ -366,8 +366,8 @@ func (r *resolver) ServeDNS(w dns.ResponseWriter, query *dns.Msg) {
 	if query == nil || len(query.Question) == 0 {
 		return
 	}
-	name := query.Question[0].Name
 
+	name := query.Question[0].Name
 	switch query.Question[0].Qtype {
 	case dns.TypeA:
 		resp, err = r.handleIPQuery(name, query, types.IPv4)
@@ -484,7 +484,7 @@ func (r *resolver) ServeDNS(w dns.ResponseWriter, query *dns.Msg) {
 			resp, err = co.ReadMsg()
 			// Truncated DNS replies should be sent to the client so that the
 			// client can retry over TCP
-			if err != nil && err != dns.ErrTruncated {
+			if err != nil && (resp == nil || !resp.Truncated) {
 				r.forwardQueryEnd()
 				logrus.Debugf("[resolver] read from DNS server failed, %s", err)
 				continue

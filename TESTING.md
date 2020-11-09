@@ -28,7 +28,7 @@ Most code changes will fall into one of the following categories.
 ### Writing tests for new features
 
 New code should be covered by unit tests. If the code is difficult to test with
-a unit tests then that is a good sign that it should be refactored to make it
+unit tests, then that is a good sign that it should be refactored to make it
 easier to reuse and maintain. Consider accepting unexported interfaces instead
 of structs so that fakes can be provided for dependencies.
 
@@ -44,12 +44,12 @@ case. Error cases should be handled by unit tests.
 
 Bugs fixes should include a unit test case which exercises the bug.
 
-A bug fix may also include new assertions in an existing integration tests for the
+A bug fix may also include new assertions in existing integration tests for the
 API endpoint.
 
 ### Integration tests environment considerations
 
-When adding new tests or modifying existing test under `integration/`, testing 
+When adding new tests or modifying existing tests under `integration/`, testing
 environment should be properly considered. `skip.If` from 
 [gotest.tools/skip](https://godoc.org/gotest.tools/skip) can be used to make the 
 test run conditionally. Full testing environment conditions can be found at 
@@ -67,6 +67,8 @@ If a remote daemon is detected, the test will be skipped.
 
 ## Running tests
 
+### Unit Tests
+
 To run the unit test suite:
 
 ```
@@ -82,8 +84,36 @@ The following environment variables may be used to run a subset of tests:
 * `TESTFLAGS` - flags passed to `go test`, to run tests which match a pattern
   use `TESTFLAGS="-test.run TestNameOrPrefix"`
 
+### Integration Tests
+
 To run the integration test suite:
 
 ```
 make test-integration
+```
+
+This make target runs both the "integration" suite and the "integration-cli"
+suite.
+
+You can specify which integration test dirs to build and run by specifying
+the list of dirs in the TEST_INTEGRATION_DIR environment variable.
+
+You can also explicitly skip either suite by setting (any value) in
+TEST_SKIP_INTEGRATION and/or TEST_SKIP_INTEGRATION_CLI environment variables.
+
+Flags specific to each suite can be set in the TESTFLAGS_INTEGRATION and
+TESTFLAGS_INTEGRATION_CLI environment variables.
+
+If all you want is to specify a test filter to run, you can set the
+`TEST_FILTER` environment variable. This ends up getting passed directly to `go
+test -run` (or `go test -check-f`, depending on the test suite). It will also
+automatically set the other above mentioned environment variables accordingly.
+
+### Go Version
+
+You can change a version of golang used for building stuff that is being tested
+by setting `GO_VERSION` variable, for example:
+
+```
+make GO_VERSION=1.12.8 test
 ```

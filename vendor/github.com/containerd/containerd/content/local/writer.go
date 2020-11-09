@@ -74,6 +74,9 @@ func (w *writer) Write(p []byte) (n int, err error) {
 }
 
 func (w *writer) Commit(ctx context.Context, size int64, expected digest.Digest, opts ...content.Opt) error {
+	// Ensure even on error the writer is fully closed
+	defer unlock(w.ref)
+
 	var base content.Info
 	for _, opt := range opts {
 		if err := opt(&base); err != nil {
@@ -81,8 +84,6 @@ func (w *writer) Commit(ctx context.Context, size int64, expected digest.Digest,
 		}
 	}
 
-	// Ensure even on error the writer is fully closed
-	defer unlock(w.ref)
 	fp := w.fp
 	w.fp = nil
 
@@ -114,8 +115,8 @@ func (w *writer) Commit(ctx context.Context, size int64, expected digest.Digest,
 	}
 
 	var (
-		ingest = filepath.Join(w.path, "data")
-		target = w.s.blobPath(dgst)
+		ingest    = filepath.Join(w.path, "data")
+		target, _ = w.s.blobPath(dgst) // ignore error because we calculated this dgst
 	)
 
 	// make sure parent directories of blob exist

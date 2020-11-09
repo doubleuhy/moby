@@ -14,7 +14,7 @@ import (
 func loadXattr(origpath string, stat *types.Stat) error {
 	xattrs, err := sysx.LListxattr(origpath)
 	if err != nil {
-		if errors.Cause(err) == syscall.ENOTSUP {
+		if errors.Is(err, syscall.ENOTSUP) {
 			return nil
 		}
 		return errors.Wrapf(err, "failed to xattr %s", origpath)
@@ -46,14 +46,18 @@ func setUnixOpt(fi os.FileInfo, stat *types.Stat, path string, seenFiles map[uin
 		}
 
 		ino := s.Ino
+		linked := false
 		if seenFiles != nil {
 			if s.Nlink > 1 {
 				if oldpath, ok := seenFiles[ino]; ok {
 					stat.Linkname = oldpath
 					stat.Size_ = 0
+					linked = true
 				}
 			}
-			seenFiles[ino] = path
+			if !linked {
+				seenFiles[ino] = path
+			}
 		}
 	}
 }

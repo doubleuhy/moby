@@ -18,7 +18,8 @@ import (
 	"github.com/docker/docker/pkg/system"
 	refstore "github.com/docker/docker/reference"
 	"github.com/docker/docker/registry"
-	"github.com/opencontainers/go-digest"
+	"github.com/docker/libtrust"
+	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -72,6 +73,9 @@ type ImagePushConfig struct {
 	ConfigMediaType string
 	// LayerStores (indexed by operating system) manages layers.
 	LayerStores map[string]PushLayerProvider
+	// TrustKey is the private key for legacy signatures. This is typically
+	// an ephemeral key, since these signatures are no longer verified.
+	TrustKey libtrust.PrivateKey
 	// UploadManager dispatches uploads.
 	UploadManager *xfer.LayerUploadManager
 }
@@ -166,7 +170,7 @@ func (s *imageConfigStore) PlatformFromConfig(c []byte) (*specs.Platform, error)
 	if !system.IsOSSupported(os) {
 		return nil, system.ErrNotSupportedOperatingSystem
 	}
-	return &specs.Platform{OS: os, Architecture: unmarshalledConfig.Architecture, OSVersion: unmarshalledConfig.OSVersion}, nil
+	return &specs.Platform{OS: os, Architecture: unmarshalledConfig.Architecture, Variant: unmarshalledConfig.Variant, OSVersion: unmarshalledConfig.OSVersion}, nil
 }
 
 type storeLayerProvider struct {

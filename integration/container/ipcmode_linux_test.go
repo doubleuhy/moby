@@ -11,12 +11,15 @@ import (
 
 	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/versions"
+	"github.com/docker/docker/client"
 	"github.com/docker/docker/integration/internal/container"
-	"github.com/docker/docker/internal/test/daemon"
-	"gotest.tools/assert"
-	is "gotest.tools/assert/cmp"
-	"gotest.tools/fs"
-	"gotest.tools/skip"
+	"github.com/docker/docker/testutil/daemon"
+	"github.com/docker/docker/testutil/request"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/fs"
+	"gotest.tools/v3/skip"
 )
 
 // testIpcCheckDevExists checks whether a given mount (identified by its
@@ -63,7 +66,7 @@ func testIpcNonePrivateShareable(t *testing.T, mode string, mustBeMounted bool, 
 	client := testEnv.APIClient()
 	ctx := context.Background()
 
-	resp, err := client.ContainerCreate(ctx, &cfg, &hostCfg, nil, "")
+	resp, err := client.ContainerCreate(ctx, &cfg, &hostCfg, nil, nil, "")
 	assert.NilError(t, err)
 	assert.Check(t, is.Equal(len(resp.Warnings), 0))
 
@@ -113,6 +116,7 @@ func TestIpcModePrivate(t *testing.T) {
 // also exists on the host.
 func TestIpcModeShareable(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon)
+	skip.If(t, testEnv.IsRootless, "cannot test /dev/shm in rootless")
 
 	testIpcNonePrivateShareable(t, "shareable", true, true)
 }
@@ -134,7 +138,7 @@ func testIpcContainer(t *testing.T, donorMode string, mustWork bool) {
 	client := testEnv.APIClient()
 
 	// create and start the "donor" container
-	resp, err := client.ContainerCreate(ctx, &cfg, &hostCfg, nil, "")
+	resp, err := client.ContainerCreate(ctx, &cfg, &hostCfg, nil, nil, "")
 	assert.NilError(t, err)
 	assert.Check(t, is.Equal(len(resp.Warnings), 0))
 	name1 := resp.ID
@@ -144,7 +148,7 @@ func testIpcContainer(t *testing.T, donorMode string, mustWork bool) {
 
 	// create and start the second container
 	hostCfg.IpcMode = containertypes.IpcMode("container:" + name1)
-	resp, err = client.ContainerCreate(ctx, &cfg, &hostCfg, nil, "")
+	resp, err = client.ContainerCreate(ctx, &cfg, &hostCfg, nil, nil, "")
 	assert.NilError(t, err)
 	assert.Check(t, is.Equal(len(resp.Warnings), 0))
 	name2 := resp.ID
@@ -188,6 +192,7 @@ func TestAPIIpcModeShareableAndContainer(t *testing.T) {
 func TestAPIIpcModeHost(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon)
 	skip.If(t, testEnv.IsUserNamespace)
+	skip.If(t, testEnv.IsRootless, "cannot test /dev/shm in rootless")
 
 	cfg := containertypes.Config{
 		Image: "busybox",
@@ -199,7 +204,7 @@ func TestAPIIpcModeHost(t *testing.T) {
 	ctx := context.Background()
 
 	client := testEnv.APIClient()
-	resp, err := client.ContainerCreate(ctx, &cfg, &hostCfg, nil, "")
+	resp, err := client.ContainerCreate(ctx, &cfg, &hostCfg, nil, nil, "")
 	assert.NilError(t, err)
 	assert.Check(t, is.Equal(len(resp.Warnings), 0))
 	name := resp.ID
@@ -236,7 +241,7 @@ func testDaemonIpcPrivateShareable(t *testing.T, mustBeShared bool, arg ...strin
 	}
 	ctx := context.Background()
 
-	resp, err := c.ContainerCreate(ctx, &cfg, &containertypes.HostConfig{}, nil, "")
+	resp, err := c.ContainerCreate(ctx, &cfg, &containertypes.HostConfig{}, nil, nil, "")
 	assert.NilError(t, err)
 	assert.Check(t, is.Equal(len(resp.Warnings), 0))
 
@@ -259,6 +264,7 @@ func testDaemonIpcPrivateShareable(t *testing.T, mustBeShared bool, arg ...strin
 // TestDaemonIpcModeShareable checks that --default-ipc-mode shareable works as intended.
 func TestDaemonIpcModeShareable(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon)
+	skip.If(t, testEnv.IsRootless, "cannot test /dev/shm in rootless")
 
 	testDaemonIpcPrivateShareable(t, true, "--default-ipc-mode", "shareable")
 }
@@ -272,6 +278,7 @@ func TestDaemonIpcModePrivate(t *testing.T) {
 
 // used to check if an IpcMode given in config works as intended
 func testDaemonIpcFromConfig(t *testing.T, mode string, mustExist bool) {
+	skip.If(t, testEnv.IsRootless, "cannot test /dev/shm in rootless")
 	config := `{"default-ipc-mode": "` + mode + `"}`
 	file := fs.NewFile(t, "test-daemon-ipc-config", fs.WithContent(config))
 	defer file.Remove()
@@ -291,4 +298,31 @@ func TestDaemonIpcModeShareableFromConfig(t *testing.T) {
 	skip.If(t, testEnv.IsRemoteDaemon)
 
 	testDaemonIpcFromConfig(t, "shareable", true)
+}
+
+// TestIpcModeOlderClient checks that older client gets shareable IPC mode
+// by default, even when the daemon default is private.
+func TestIpcModeOlderClient(t *testing.T) {
+	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.40"), "requires a daemon with DefaultIpcMode: private")
+	c := testEnv.APIClient()
+	skip.If(t, versions.LessThan(c.ClientVersion(), "1.40"), "requires client API >= 1.40")
+
+	t.Parallel()
+
+	ctx := context.Background()
+
+	// pre-check: default ipc mode in daemon is private
+	cID := container.Create(ctx, t, c, container.WithAutoRemove)
+
+	inspect, err := c.ContainerInspect(ctx, cID)
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(string(inspect.HostConfig.IpcMode), "private"))
+
+	// main check: using older client creates "shareable" container
+	c = request.NewAPIClient(t, client.WithVersion("1.39"))
+	cID = container.Create(ctx, t, c, container.WithAutoRemove)
+
+	inspect, err = c.ContainerInspect(ctx, cID)
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(string(inspect.HostConfig.IpcMode), "shareable"))
 }

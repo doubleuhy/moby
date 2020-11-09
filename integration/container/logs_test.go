@@ -8,8 +8,8 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/integration/internal/container"
 	"github.com/docker/docker/pkg/stdcopy"
-	"gotest.tools/assert"
-	"gotest.tools/skip"
+	"gotest.tools/v3/assert"
+	"gotest.tools/v3/skip"
 )
 
 // Regression test for #35370
@@ -21,7 +21,7 @@ func TestLogsFollowTailEmpty(t *testing.T) {
 	client := testEnv.APIClient()
 	ctx := context.Background()
 
-	id := container.Run(t, ctx, client, container.WithCmd("sleep", "100000"))
+	id := container.Run(ctx, t, client, container.WithCmd("sleep", "100000"))
 
 	logs, err := client.ContainerLogs(ctx, id, types.ContainerLogsOptions{ShowStdout: true, Tail: "2"})
 	if logs != nil {

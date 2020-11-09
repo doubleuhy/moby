@@ -204,9 +204,10 @@ func (r *controller) Start(ctx context.Context) error {
 		return exec.ErrTaskStarted
 	}
 
+	var lnErr libnetwork.ErrNoSuchNetwork
 	for {
 		if err := r.adapter.start(ctx); err != nil {
-			if _, ok := errors.Cause(err).(libnetwork.ErrNoSuchNetwork); ok {
+			if errors.As(err, &lnErr) {
 				// Retry network creation again if we
 				// failed because some of the networks
 				// were not found.
@@ -369,11 +370,17 @@ func (r *controller) Shutdown(ctx context.Context) error {
 	}
 
 	if err := r.adapter.shutdown(ctx); err != nil {
-		if isUnknownContainer(err) || isStoppedContainer(err) {
-			return nil
+		if !(isUnknownContainer(err) || isStoppedContainer(err)) {
+			return err
 		}
+	}
 
-		return err
+	// Try removing networks referenced in this task in case this
+	// task is the last one referencing it
+	if err := r.adapter.removeNetworks(ctx); err != nil {
+		if !isUnknownContainer(err) {
+			return err
+		}
 	}
 
 	return nil
@@ -417,15 +424,6 @@ func (r *controller) Remove(ctx context.Context) error {
 		}
 		// This may fail if the task was already shut down.
 		log.G(ctx).WithError(err).Debug("shutdown failed on removal")
-	}
-
-	// Try removing networks referenced in this task in case this
-	// task is the last one referencing it
-	if err := r.adapter.removeNetworks(ctx); err != nil {
-		if isUnknownContainer(err) {
-			return nil
-		}
-		return err
 	}
 
 	if err := r.adapter.remove(ctx); err != nil {
@@ -511,7 +509,9 @@ func (r *controller) Logs(ctx context.Context, publisher exec.LogPublisher, opti
 	var (
 		// use a rate limiter to keep things under control but also provides some
 		// ability coalesce messages.
-		limiter = rate.NewLimiter(rate.Every(time.Second), 10<<20) // 10 MB/s
+		// this will implement a "token bucket" of size 10 MB, initially full and refilled
+		// at rate 10 MB tokens per second.
+		limiter = rate.NewLimiter(10<<20, 10<<20) // 10 MB/s
 		msgctx  = api.LogContext{
 			NodeID:    r.task.NodeID,
 			ServiceID: r.task.ServiceID,
@@ -638,7 +638,7 @@ func parsePortMap(portMap nat.PortMap) ([]*api.PortConfig, error) {
 			return nil, err
 		}
 
-		protocol := api.ProtocolTCP
+		var protocol api.PortConfig_Protocol
 		switch strings.ToLower(parts[1]) {
 		case "tcp":
 			protocol = api.ProtocolTCP

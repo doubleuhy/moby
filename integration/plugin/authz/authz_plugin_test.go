@@ -22,12 +22,12 @@ import (
 	eventtypes "github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/integration/internal/container"
-	"github.com/docker/docker/internal/test/environment"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/authorization"
-	"gotest.tools/assert"
-	"gotest.tools/poll"
-	"gotest.tools/skip"
+	"github.com/docker/docker/testutil/environment"
+	"gotest.tools/v3/assert"
+	"gotest.tools/v3/poll"
+	"gotest.tools/v3/skip"
 )
 
 const (
@@ -92,7 +92,7 @@ func TestAuthZPluginAllowRequest(t *testing.T) {
 	ctx := context.Background()
 
 	// Ensure command successful
-	cID := container.Run(t, ctx, c)
+	cID := container.Run(ctx, t, c)
 
 	assertURIRecorded(t, ctrl.requestsURIs, "/containers/create")
 	assertURIRecorded(t, ctrl.requestsURIs, fmt.Sprintf("/containers/%s/start", cID))
@@ -178,7 +178,7 @@ func TestAuthZPluginAPIDenyResponse(t *testing.T) {
 	conn, err := net.DialTimeout(daemonURL.Scheme, daemonURL.Path, time.Second*10)
 	assert.NilError(t, err)
 	c := httputil.NewClientConn(conn, nil)
-	req, err := http.NewRequest("GET", "/version", nil)
+	req, err := http.NewRequest(http.MethodGet, "/version", nil)
 	assert.NilError(t, err)
 	resp, err := c.Do(req)
 
@@ -224,7 +224,7 @@ func TestAuthZPluginAllowEventStream(t *testing.T) {
 	defer cancel()
 
 	// Create a container and wait for the creation events
-	cID := container.Run(t, ctx, c)
+	cID := container.Run(ctx, t, c)
 	poll.WaitOn(t, container.IsInState(ctx, c, cID, "running"))
 
 	created := false
@@ -348,7 +348,7 @@ func TestAuthZPluginEnsureLoadImportWorking(t *testing.T) {
 
 	exportedImagePath := filepath.Join(tmp, "export.tar")
 
-	cID := container.Run(t, ctx, c)
+	cID := container.Run(ctx, t, c)
 
 	responseReader, err := c.ContainerExport(context.Background(), cID)
 	assert.NilError(t, err)
@@ -388,7 +388,7 @@ func TestAuthzPluginEnsureContainerCopyToFrom(t *testing.T) {
 	c := d.NewClientT(t)
 	ctx := context.Background()
 
-	cID := container.Run(t, ctx, c)
+	cID := container.Run(ctx, t, c)
 	defer c.ContainerRemove(ctx, cID, types.ContainerRemoveOptions{Force: true})
 
 	_, err = f.Seek(0, io.SeekStart)
@@ -477,7 +477,7 @@ func TestAuthZPluginHeader(t *testing.T) {
 	conn, err := net.DialTimeout(daemonURL.Scheme, daemonURL.Path, time.Second*10)
 	assert.NilError(t, err)
 	client := httputil.NewClientConn(conn, nil)
-	req, err := http.NewRequest("GET", "/version", nil)
+	req, err := http.NewRequest(http.MethodGet, "/version", nil)
 	assert.NilError(t, err)
 	resp, err := client.Do(req)
 	assert.NilError(t, err)

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/containerd/containerd/platforms"
 	"github.com/docker/docker/api/server/httputils"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
@@ -19,6 +20,7 @@ import (
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/signal"
+	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/websocket"
@@ -41,7 +43,7 @@ func (s *containerRouter) postCommit(ctx context.Context, w http.ResponseWriter,
 	}
 
 	config, _, _, err := s.decoder.DecodeConfig(r.Body)
-	if err != nil && err != io.EOF { //Do not fail if body is empty.
+	if err != nil && err != io.EOF { // Do not fail if body is empty.
 		return err
 	}
 
@@ -105,9 +107,14 @@ func (s *containerRouter) getContainersStats(ctx context.Context, w http.Respons
 	if !stream {
 		w.Header().Set("Content-Type", "application/json")
 	}
+	var oneShot bool
+	if versions.GreaterThanOrEqualTo(httputils.VersionFromContext(ctx), "1.41") {
+		oneShot = httputils.BoolValueOrDefault(r, "one-shot", false)
+	}
 
 	config := &backend.ContainerStatsConfig{
 		Stream:    stream,
+		OneShot:   oneShot,
 		OutStream: w,
 		Version:   httputils.VersionFromContext(ctx),
 	}
@@ -428,6 +435,13 @@ func (s *containerRouter) postContainerUpdate(ctx context.Context, w http.Respon
 	if versions.LessThan(httputils.VersionFromContext(ctx), "1.40") {
 		updateConfig.PidsLimit = nil
 	}
+	if updateConfig.PidsLimit != nil && *updateConfig.PidsLimit <= 0 {
+		// Both `0` and `-1` are accepted to set "unlimited" when updating.
+		// Historically, any negative value was accepted, so treat them as
+		// "unlimited" as well.
+		var unlimited int64
+		updateConfig.PidsLimit = &unlimited
+	}
 
 	hostConfig := &container.HostConfig{
 		Resources:     updateConfig.Resources,
@@ -474,11 +488,36 @@ func (s *containerRouter) postContainersCreate(ctx context.Context, w http.Respo
 		}
 		// Ignore KernelMemoryTCP because it was added in API 1.40.
 		hostConfig.KernelMemoryTCP = 0
+
+		// Older clients (API < 1.40) expects the default to be shareable, make them happy
+		if hostConfig.IpcMode.IsEmpty() {
+			hostConfig.IpcMode = container.IpcMode("shareable")
+		}
+	}
+	if hostConfig != nil && versions.LessThan(version, "1.41") && !s.cgroup2 {
+		// Older clients expect the default to be "host" on cgroup v1 hosts
+		if hostConfig.CgroupnsMode.IsEmpty() {
+			hostConfig.CgroupnsMode = container.CgroupnsMode("host")
+		}
 	}
 
-	// Ignore Capabilities because it was added in API 1.40.
-	if hostConfig != nil && versions.LessThan(version, "1.40") {
-		hostConfig.Capabilities = nil
+	var platform *specs.Platform
+	if versions.GreaterThanOrEqualTo(version, "1.41") {
+		if v := r.Form.Get("platform"); v != "" {
+			p, err := platforms.Parse(v)
+			if err != nil {
+				return errdefs.InvalidParameter(err)
+			}
+			platform = &p
+		}
+	}
+
+	if hostConfig != nil && hostConfig.PidsLimit != nil && *hostConfig.PidsLimit <= 0 {
+		// Don't set a limit if either no limit was specified, or "unlimited" was
+		// explicitly set.
+		// Both `0` and `-1` are accepted as "unlimited", and historically any
+		// negative value was accepted, so treat those as "unlimited" as well.
+		hostConfig.PidsLimit = nil
 	}
 
 	ccr, err := s.backend.ContainerCreate(types.ContainerCreateConfig{
@@ -487,6 +526,7 @@ func (s *containerRouter) postContainersCreate(ctx context.Context, w http.Respo
 		HostConfig:       hostConfig,
 		NetworkingConfig: networkingConfig,
 		AdjustCPUShares:  adjustCPUShares,
+		Platform:         platform,
 	})
 	if err != nil {
 		return err
@@ -586,7 +626,7 @@ func (s *containerRouter) postContainersAttach(ctx context.Context, w http.Respo
 		// Remember to close stream if error happens
 		conn, _, errHijack := hijacker.Hijack()
 		if errHijack == nil {
-			statusCode := httputils.GetHTTPErrorStatusCode(err)
+			statusCode := errdefs.GetHTTPErrorStatusCode(err)
 			statusText := http.StatusText(statusCode)
 			fmt.Fprintf(conn, "HTTP/1.1 %d %s\r\nContent-Type: application/vnd.docker.raw-stream\r\n\r\n%s\r\n", statusCode, statusText, err.Error())
 			httputils.CloseStreams(conn)

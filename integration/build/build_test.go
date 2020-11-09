@@ -13,15 +13,15 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/versions"
-	"github.com/docker/docker/internal/test/fakecontext"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/jsonmessage"
-	"gotest.tools/assert"
-	is "gotest.tools/assert/cmp"
-	"gotest.tools/skip"
+	"github.com/docker/docker/testutil/fakecontext"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/skip"
 )
 
 func TestBuildWithRemoveAndForceRemove(t *testing.T) {
-	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME")
 	defer setupTest(t)()
 
 	cases := []struct {
@@ -135,9 +135,59 @@ func buildContainerIdsFilter(buildOutput io.Reader) (filters.Args, error) {
 	}
 }
 
+// TestBuildMultiStageCopy verifies that copying between stages works correctly.
+//
+// Regression test for docker/for-win#4349, ENGCORE-935, where creating the target
+// directory failed on Windows, because `os.MkdirAll()` was called with a volume
+// GUID path (\\?\Volume{dae8d3ac-b9a1-11e9-88eb-e8554b2ba1db}\newdir\hello}),
+// which currently isn't supported by Golang.
+func TestBuildMultiStageCopy(t *testing.T) {
+	ctx := context.Background()
+
+	dockerfile, err := ioutil.ReadFile("testdata/Dockerfile." + t.Name())
+	assert.NilError(t, err)
+
+	source := fakecontext.New(t, "", fakecontext.WithDockerfile(string(dockerfile)))
+	defer source.Close()
+
+	apiclient := testEnv.APIClient()
+
+	for _, target := range []string{"copy_to_root", "copy_to_newdir", "copy_to_newdir_nested", "copy_to_existingdir", "copy_to_newsubdir"} {
+		t.Run(target, func(t *testing.T) {
+			imgName := strings.ToLower(t.Name())
+
+			resp, err := apiclient.ImageBuild(
+				ctx,
+				source.AsTarReader(t),
+				types.ImageBuildOptions{
+					Remove:      true,
+					ForceRemove: true,
+					Target:      target,
+					Tags:        []string{imgName},
+				},
+			)
+			assert.NilError(t, err)
+
+			out := bytes.NewBuffer(nil)
+			_, err = io.Copy(out, resp.Body)
+			_ = resp.Body.Close()
+			if err != nil {
+				t.Log(out)
+			}
+			assert.NilError(t, err)
+
+			// verify the image was successfully built
+			_, _, err = apiclient.ImageInspectWithRaw(ctx, imgName)
+			if err != nil {
+				t.Log(out)
+			}
+			assert.NilError(t, err)
+		})
+	}
+}
+
 func TestBuildMultiStageParentConfig(t *testing.T) {
 	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.35"), "broken in earlier versions")
-	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME")
 	dockerfile := `
 		FROM busybox AS stage0
 		ENV WHO=parent
@@ -155,19 +205,20 @@ func TestBuildMultiStageParentConfig(t *testing.T) {
 	defer source.Close()
 
 	apiclient := testEnv.APIClient()
+	imgName := strings.ToLower(t.Name())
 	resp, err := apiclient.ImageBuild(ctx,
 		source.AsTarReader(t),
 		types.ImageBuildOptions{
 			Remove:      true,
 			ForceRemove: true,
-			Tags:        []string{"build1"},
+			Tags:        []string{imgName},
 		})
 	assert.NilError(t, err)
 	_, err = io.Copy(ioutil.Discard, resp.Body)
 	resp.Body.Close()
 	assert.NilError(t, err)
 
-	image, _, err := apiclient.ImageInspectWithRaw(ctx, "build1")
+	image, _, err := apiclient.ImageInspectWithRaw(ctx, imgName)
 	assert.NilError(t, err)
 
 	expected := "/foo/sub2"
@@ -182,7 +233,7 @@ func TestBuildMultiStageParentConfig(t *testing.T) {
 func TestBuildLabelWithTargets(t *testing.T) {
 	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.38"), "test added after 1.38")
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME")
-	bldName := "build-a"
+	imgName := strings.ToLower(t.Name() + "-a")
 	testLabels := map[string]string{
 		"foo":  "bar",
 		"dead": "beef",
@@ -208,7 +259,7 @@ func TestBuildLabelWithTargets(t *testing.T) {
 		types.ImageBuildOptions{
 			Remove:      true,
 			ForceRemove: true,
-			Tags:        []string{bldName},
+			Tags:        []string{imgName},
 			Labels:      testLabels,
 			Target:      "target-a",
 		})
@@ -217,7 +268,7 @@ func TestBuildLabelWithTargets(t *testing.T) {
 	resp.Body.Close()
 	assert.NilError(t, err)
 
-	image, _, err := apiclient.ImageInspectWithRaw(ctx, bldName)
+	image, _, err := apiclient.ImageInspectWithRaw(ctx, imgName)
 	assert.NilError(t, err)
 
 	testLabels["label-a"] = "inline-a"
@@ -228,14 +279,14 @@ func TestBuildLabelWithTargets(t *testing.T) {
 	}
 
 	// For `target-b` build
-	bldName = "build-b"
+	imgName = strings.ToLower(t.Name() + "-b")
 	delete(testLabels, "label-a")
 	resp, err = apiclient.ImageBuild(ctx,
 		source.AsTarReader(t),
 		types.ImageBuildOptions{
 			Remove:      true,
 			ForceRemove: true,
-			Tags:        []string{bldName},
+			Tags:        []string{imgName},
 			Labels:      testLabels,
 			Target:      "target-b",
 		})
@@ -244,7 +295,7 @@ func TestBuildLabelWithTargets(t *testing.T) {
 	resp.Body.Close()
 	assert.NilError(t, err)
 
-	image, _, err = apiclient.ImageInspectWithRaw(ctx, bldName)
+	image, _, err = apiclient.ImageInspectWithRaw(ctx, imgName)
 	assert.NilError(t, err)
 
 	testLabels["label-b"] = "inline-b"
@@ -288,7 +339,6 @@ func TestBuildWithEmptyLayers(t *testing.T) {
 // #35652
 func TestBuildMultiStageOnBuild(t *testing.T) {
 	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.33"), "broken in earlier versions")
-	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME")
 	defer setupTest(t)()
 	// test both metadata and layer based commands as they may be implemented differently
 	dockerfile := `FROM busybox AS stage1
@@ -325,7 +375,7 @@ RUN cat somefile`
 
 	imageIDs, err := getImageIDsFromBuild(out.Bytes())
 	assert.NilError(t, err)
-	assert.Check(t, is.Equal(3, len(imageIDs)))
+	assert.Assert(t, is.Equal(3, len(imageIDs)))
 
 	image, _, err := apiclient.ImageInspectWithRaw(context.Background(), imageIDs[2])
 	assert.NilError(t, err)
@@ -395,7 +445,6 @@ COPY bar /`
 // docker/for-linux#135
 // #35641
 func TestBuildMultiStageLayerLeak(t *testing.T) {
-	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME")
 	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.37"), "broken in earlier versions")
 	ctx := context.TODO()
 	defer setupTest(t)()
@@ -435,15 +484,22 @@ RUN [ ! -f foo ]
 }
 
 // #37581
+// #40444 (Windows Containers only)
 func TestBuildWithHugeFile(t *testing.T) {
-	skip.If(t, testEnv.OSType == "windows")
 	ctx := context.TODO()
 	defer setupTest(t)()
 
 	dockerfile := `FROM busybox
-# create a sparse file with size over 8GB
+`
+
+	if testEnv.DaemonInfo.OSType == "windows" {
+		dockerfile += `# create a file with size of 8GB
+RUN powershell "fsutil.exe file createnew bigfile.txt 8589934592 ; dir bigfile.txt"`
+	} else {
+		dockerfile += `# create a sparse file with size over 8GB
 RUN for g in $(seq 0 8); do dd if=/dev/urandom of=rnd bs=1K count=1 seek=$((1024*1024*g)) status=none; done && \
     ls -la rnd && du -sk rnd`
+	}
 
 	buf := bytes.NewBuffer(nil)
 	w := tar.NewWriter(buf)
@@ -468,6 +524,7 @@ RUN for g in $(seq 0 8); do dd if=/dev/urandom of=rnd bs=1K count=1 seek=$((1024
 }
 
 func TestBuildWithEmptyDockerfile(t *testing.T) {
+	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.40"), "broken in earlier versions")
 	ctx := context.TODO()
 	defer setupTest(t)()
 
@@ -520,6 +577,73 @@ func TestBuildWithEmptyDockerfile(t *testing.T) {
 			assert.Check(t, is.Contains(err.Error(), tc.expectedErr))
 		})
 	}
+}
+
+func TestBuildPreserveOwnership(t *testing.T) {
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "FIXME")
+	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.40"), "broken in earlier versions")
+
+	ctx := context.Background()
+
+	dockerfile, err := ioutil.ReadFile("testdata/Dockerfile." + t.Name())
+	assert.NilError(t, err)
+
+	source := fakecontext.New(t, "", fakecontext.WithDockerfile(string(dockerfile)))
+	defer source.Close()
+
+	apiclient := testEnv.APIClient()
+
+	for _, target := range []string{"copy_from", "copy_from_chowned"} {
+		t.Run(target, func(t *testing.T) {
+			resp, err := apiclient.ImageBuild(
+				ctx,
+				source.AsTarReader(t),
+				types.ImageBuildOptions{
+					Remove:      true,
+					ForceRemove: true,
+					Target:      target,
+				},
+			)
+			assert.NilError(t, err)
+
+			out := bytes.NewBuffer(nil)
+			_, err = io.Copy(out, resp.Body)
+			_ = resp.Body.Close()
+			if err != nil {
+				t.Log(out)
+			}
+			assert.NilError(t, err)
+		})
+	}
+}
+
+func TestBuildPlatformInvalid(t *testing.T) {
+	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.40"), "experimental in older versions")
+
+	ctx := context.Background()
+	defer setupTest(t)()
+
+	dockerfile := `FROM busybox
+`
+
+	buf := bytes.NewBuffer(nil)
+	w := tar.NewWriter(buf)
+	writeTarRecord(t, w, "Dockerfile", dockerfile)
+	err := w.Close()
+	assert.NilError(t, err)
+
+	apiclient := testEnv.APIClient()
+	_, err = apiclient.ImageBuild(ctx,
+		buf,
+		types.ImageBuildOptions{
+			Remove:      true,
+			ForceRemove: true,
+			Platform:    "foobar",
+		})
+
+	assert.Assert(t, err != nil)
+	assert.ErrorContains(t, err, "unknown operating system or architecture")
+	assert.Assert(t, errdefs.IsInvalidParameter(err))
 }
 
 func writeTarRecord(t *testing.T, w *tar.Writer, fn, contents string) {

@@ -7,13 +7,14 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/integration/internal/network"
 	"github.com/docker/docker/integration/internal/swarm"
-	"gotest.tools/assert"
-	"gotest.tools/poll"
-	"gotest.tools/skip"
+	"gotest.tools/v3/assert"
+	"gotest.tools/v3/poll"
+	"gotest.tools/v3/skip"
 )
 
 func TestInspectNetwork(t *testing.T) {
 	skip.If(t, testEnv.OSType == "windows", "FIXME")
+	skip.If(t, testEnv.IsRootless, "rootless mode doesn't support Swarm-mode")
 	defer setupTest(t)()
 	d := swarm.NewSwarm(t, testEnv)
 	defer d.Stop(t)
@@ -21,7 +22,7 @@ func TestInspectNetwork(t *testing.T) {
 	defer c.Close()
 
 	networkName := "Overlay" + t.Name()
-	overlayID := network.CreateNoError(t, context.Background(), c, networkName,
+	overlayID := network.CreateNoError(context.Background(), t, c, networkName,
 		network.WithDriver("overlay"),
 		network.WithCheckDuplicate(),
 	)

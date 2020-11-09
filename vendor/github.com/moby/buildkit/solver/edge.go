@@ -3,6 +3,7 @@ package solver
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/moby/buildkit/solver/internal/pipe"
 	digest "github.com/opencontainers/go-digest"
@@ -25,12 +26,13 @@ func (t edgeStatusType) String() string {
 
 func newEdge(ed Edge, op activeOp, index *edgeIndex) *edge {
 	e := &edge{
-		edge:         ed,
-		op:           op,
-		depRequests:  map[pipe.Receiver]*dep{},
-		keyMap:       map[string]*CacheKey{},
-		cacheRecords: map[string]*CacheRecord{},
-		index:        index,
+		edge:               ed,
+		op:                 op,
+		depRequests:        map[pipe.Receiver]*dep{},
+		keyMap:             map[string]struct{}{},
+		cacheRecords:       map[string]*CacheRecord{},
+		cacheRecordsLoaded: map[string]struct{}{},
+		index:              index,
 	}
 	return e
 }
@@ -43,14 +45,16 @@ type edge struct {
 	depRequests map[pipe.Receiver]*dep
 	deps        []*dep
 
-	cacheMapReq     pipe.Receiver
-	cacheMapDone    bool
-	cacheMapIndex   int
-	cacheMapDigests []digest.Digest
-	execReq         pipe.Receiver
-	err             error
-	cacheRecords    map[string]*CacheRecord
-	keyMap          map[string]*CacheKey
+	cacheMapReq        pipe.Receiver
+	cacheMapDone       bool
+	cacheMapIndex      int
+	cacheMapDigests    []digest.Digest
+	execReq            pipe.Receiver
+	execCacheLoad      bool
+	err                error
+	cacheRecords       map[string]*CacheRecord
+	cacheRecordsLoaded map[string]struct{}
+	keyMap             map[string]struct{}
 
 	noCacheMatchPossible      bool
 	allDepsCompletedCacheFast bool
@@ -176,6 +180,9 @@ func (e *edge) finishIncoming(req pipe.Sender) {
 
 // updateIncoming updates the current value of incoming pipe request
 func (e *edge) updateIncoming(req pipe.Sender) {
+	if debugScheduler {
+		logrus.Debugf("updateIncoming %s %#v desired=%s", e.edge.Vertex.Name(), e.edgeState, req.Request().Payload.(*edgeRequest).desiredState)
+	}
 	req.Update(&e.edgeState)
 }
 
@@ -330,7 +337,8 @@ func (e *edge) unpark(incoming []pipe.Sender, updates, allPipes []pipe.Receiver,
 	if e.cacheMapReq == nil && (e.cacheMap == nil || len(e.cacheRecords) == 0) {
 		index := e.cacheMapIndex
 		e.cacheMapReq = f.NewFuncRequest(func(ctx context.Context) (interface{}, error) {
-			return e.op.CacheMap(ctx, index)
+			cm, err := e.op.CacheMap(ctx, index)
+			return cm, errors.Wrap(err, "failed to load cache key")
 		})
 		cacheMapReq = true
 	}
@@ -420,7 +428,11 @@ func (e *edge) processUpdate(upt pipe.Receiver) (depChanged bool) {
 	if upt == e.execReq && upt.Status().Completed {
 		if err := upt.Status().Err; err != nil {
 			e.execReq = nil
-			if !upt.Status().Canceled && e.err == nil {
+			if e.execCacheLoad {
+				for k := range e.cacheRecordsLoaded {
+					delete(e.cacheRecords, k)
+				}
+			} else if !upt.Status().Canceled && e.err == nil {
 				e.err = err
 			}
 		} else {
@@ -526,6 +538,10 @@ func (e *edge) recalcCurrentState() {
 		}
 	}
 
+	for key := range newKeys {
+		e.keyMap[key] = struct{}{}
+	}
+
 	for _, r := range newKeys {
 		// TODO: add all deps automatically
 		mergedKey := r.clone()
@@ -552,7 +568,9 @@ func (e *edge) recalcCurrentState() {
 		}
 
 		for _, r := range records {
-			e.cacheRecords[r.ID] = r
+			if _, ok := e.cacheRecordsLoaded[r.ID]; !ok {
+				e.cacheRecords[r.ID] = r
+			}
 		}
 
 		e.keys = append(e.keys, e.makeExportable(mergedKey, records))
@@ -612,6 +630,36 @@ func (e *edge) recalcCurrentState() {
 		e.allDepsCompletedCacheSlow = e.cacheMapDone && allDepsCompletedCacheSlow
 		e.allDepsStateCacheSlow = e.cacheMapDone && allDepsStateCacheSlow
 		e.allDepsCompleted = e.cacheMapDone && allDepsCompleted
+
+		if e.allDepsStateCacheSlow && len(e.cacheRecords) > 0 && e.state == edgeStatusCacheFast {
+			openKeys := map[string]struct{}{}
+			for _, dep := range e.deps {
+				isSlowIncomplete := e.slowCacheFunc(dep) != nil && (dep.state == edgeStatusCacheSlow || (dep.state == edgeStatusComplete && !dep.slowCacheComplete))
+				if !isSlowIncomplete {
+					openDepKeys := map[string]struct{}{}
+					for key := range dep.keyMap {
+						if _, ok := e.keyMap[key]; !ok {
+							openDepKeys[key] = struct{}{}
+						}
+					}
+					if len(openKeys) != 0 {
+						for k := range openKeys {
+							if _, ok := openDepKeys[k]; !ok {
+								delete(openKeys, k)
+							}
+						}
+					} else {
+						openKeys = openDepKeys
+					}
+					if len(openKeys) == 0 {
+						e.state = edgeStatusCacheSlow
+						if debugScheduler {
+							logrus.Debugf("upgrade to cache-slow because no open keys")
+						}
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -763,7 +811,8 @@ func (e *edge) createInputRequests(desiredState edgeStatusType, f *pipeFactory, 
 			res := dep.result
 			func(fn ResultBasedCacheFunc, res Result, index Index) {
 				dep.slowCacheReq = f.NewFuncRequest(func(ctx context.Context) (interface{}, error) {
-					return e.op.CalcSlowCache(ctx, index, fn, res)
+					v, err := e.op.CalcSlowCache(ctx, index, fn, res)
+					return v, errors.Wrap(err, "failed to compute cache key")
 				})
 			}(fn, res, dep.index)
 			addedNew = true
@@ -781,6 +830,7 @@ func (e *edge) execIfPossible(f *pipeFactory) bool {
 			return true
 		}
 		e.execReq = f.NewFuncRequest(e.loadCache)
+		e.execCacheLoad = true
 		for req := range e.depRequests {
 			req.Cancel()
 		}
@@ -791,6 +841,7 @@ func (e *edge) execIfPossible(f *pipeFactory) bool {
 			return true
 		}
 		e.execReq = f.NewFuncRequest(e.execOp)
+		e.execCacheLoad = false
 		return true
 	}
 	return false
@@ -811,11 +862,12 @@ func (e *edge) loadCache(ctx context.Context) (interface{}, error) {
 	}
 
 	rec := getBestResult(recs)
+	e.cacheRecordsLoaded[rec.ID] = struct{}{}
 
 	logrus.Debugf("load cache for %s with %s", e.edge.Vertex.Name(), rec.ID)
 	res, err := e.op.LoadCache(ctx, rec)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to load cache")
 	}
 
 	return NewCachedResult(res, []ExportableCacheKey{{CacheKey: rec.key, Exporter: &exporter{k: rec.key, record: rec, edge: e}}}), nil
@@ -826,7 +878,7 @@ func (e *edge) execOp(ctx context.Context) (interface{}, error) {
 	cacheKeys, inputs := e.commitOptions()
 	results, subExporters, err := e.op.Exec(ctx, toResultSlice(inputs))
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 
 	index := e.edge.Index
@@ -845,7 +897,7 @@ func (e *edge) execOp(ctx context.Context) (interface{}, error) {
 	var exporters []CacheExporter
 
 	for _, cacheKey := range cacheKeys {
-		ck, err := e.op.Cache().Save(cacheKey, res)
+		ck, err := e.op.Cache().Save(cacheKey, res, time.Now())
 		if err != nil {
 			return nil, err
 		}

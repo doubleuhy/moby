@@ -13,14 +13,13 @@ import (
 	containertypes "github.com/docker/docker/api/types/container"
 	mounttypes "github.com/docker/docker/api/types/mount"
 	swarmtypes "github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/pkg/mount"
 	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/docker/volume"
 	volumemounts "github.com/docker/docker/volume/mounts"
+	"github.com/moby/sys/mount"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -136,7 +135,7 @@ func (container *Container) CopyImagePathContent(v volume.Volume, destination st
 		return err
 	}
 
-	id := stringid.GenerateNonCryptoID()
+	id := stringid.GenerateRandomID()
 	path, err := v.Mount(id)
 	if err != nil {
 		return err
@@ -147,7 +146,7 @@ func (container *Container) CopyImagePathContent(v volume.Volume, destination st
 			logrus.Warnf("error while unmounting volume %s: %v", v.Name(), err)
 		}
 	}()
-	if err := label.Relabel(path, container.MountLabel, true); err != nil && err != unix.ENOTSUP {
+	if err := label.Relabel(path, container.MountLabel, true); err != nil && !errors.Is(err, syscall.ENOTSUP) {
 		return err
 	}
 	return copyExistingContents(rootfs, path)
@@ -190,7 +189,7 @@ func (container *Container) UnmountIpcMount() error {
 	if shmPath == "" {
 		return nil
 	}
-	if err = mount.Unmount(shmPath); err != nil && !os.IsNotExist(err) {
+	if err = mount.Unmount(shmPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
@@ -395,7 +394,7 @@ func (container *Container) DetachAndUnmount(volumeEventLog func(name, action st
 // are not supported
 func ignoreUnsupportedXAttrs() fs.CopyDirOpt {
 	xeh := func(dst, src, xattrKey string, err error) error {
-		if errors.Cause(err) != syscall.ENOTSUP {
+		if !errors.Is(err, syscall.ENOTSUP) {
 			return err
 		}
 		return nil
@@ -442,11 +441,6 @@ func (container *Container) TmpfsMounts() ([]Mount, error) {
 		}
 	}
 	return mounts, nil
-}
-
-// EnableServiceDiscoveryOnDefaultNetwork Enable service discovery on default network
-func (container *Container) EnableServiceDiscoveryOnDefaultNetwork() bool {
-	return false
 }
 
 // GetMountPoints gives a platform specific transformation to types.MountPoint. Callers must hold a Container lock.

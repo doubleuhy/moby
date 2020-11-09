@@ -2,21 +2,25 @@ package image // import "github.com/docker/docker/integration/image"
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
-	"gotest.tools/assert"
-	is "gotest.tools/assert/cmp"
+	"github.com/docker/docker/api/types/versions"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/skip"
 )
 
 // Regression : #38171
 func TestImagesFilterMultiReference(t *testing.T) {
+	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.40"), "broken in earlier versions")
 	defer setupTest(t)()
 	client := testEnv.APIClient()
 	ctx := context.Background()
 
-	name := "images_filter_multi_reference"
+	name := strings.ToLower(t.Name())
 	repoTags := []string{
 		name + ":v1",
 		name + ":v2",

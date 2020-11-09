@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -32,6 +33,7 @@ import (
 	"github.com/docker/swarmkit/manager/metrics"
 	"github.com/docker/swarmkit/manager/orchestrator/constraintenforcer"
 	"github.com/docker/swarmkit/manager/orchestrator/global"
+	"github.com/docker/swarmkit/manager/orchestrator/jobs"
 	"github.com/docker/swarmkit/manager/orchestrator/replicated"
 	"github.com/docker/swarmkit/manager/orchestrator/taskreaper"
 	"github.com/docker/swarmkit/manager/resourceapi"
@@ -145,6 +147,7 @@ type Manager struct {
 	watchServer            *watchapi.Server
 	replicatedOrchestrator *replicated.Orchestrator
 	globalOrchestrator     *global.Orchestrator
+	jobsOrchestrator       *jobs.Orchestrator
 	taskReaper             *taskreaper.TaskReaper
 	constraintEnforcer     *constraintenforcer.ConstraintEnforcer
 	scheduler              *scheduler.Scheduler
@@ -680,6 +683,9 @@ func (m *Manager) Stop(ctx context.Context, clearData bool) {
 	if m.globalOrchestrator != nil {
 		m.globalOrchestrator.Stop()
 	}
+	if m.jobsOrchestrator != nil {
+		m.jobsOrchestrator.Stop()
+	}
 	if m.taskReaper != nil {
 		m.taskReaper.Stop()
 	}
@@ -758,6 +764,7 @@ func (m *Manager) updateKEK(ctx context.Context, cluster *api.Cluster) error {
 					func(addr string, timeout time.Duration) (net.Conn, error) {
 						return xnet.DialTimeoutLocal(addr, timeout)
 					}),
+				grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(math.MaxInt32)),
 			)
 			if err != nil {
 				logger.WithError(err).Error("failed to connect to local manager socket after locking the cluster")
@@ -992,6 +999,7 @@ func (m *Manager) becomeLeader(ctx context.Context) {
 	m.replicatedOrchestrator = replicated.NewReplicatedOrchestrator(s)
 	m.constraintEnforcer = constraintenforcer.New(s)
 	m.globalOrchestrator = global.NewGlobalOrchestrator(s)
+	m.jobsOrchestrator = jobs.NewOrchestrator(s)
 	m.taskReaper = taskreaper.New(s)
 	m.scheduler = scheduler.New(s)
 	m.keyManager = keymanager.New(s, keymanager.DefaultConfig())
@@ -1087,6 +1095,11 @@ func (m *Manager) becomeLeader(ctx context.Context) {
 			log.G(ctx).WithError(err).Error("replicated orchestrator exited with an error")
 		}
 	}(m.replicatedOrchestrator)
+
+	go func(orchestrator *jobs.Orchestrator) {
+		// jobs orchestrator does not return errors.
+		orchestrator.Run(ctx)
+	}(m.jobsOrchestrator)
 
 	go func(globalOrchestrator *global.Orchestrator) {
 		if err := globalOrchestrator.Run(ctx); err != nil {
@@ -1222,12 +1235,8 @@ func newIngressNetwork() *api.Network {
 			},
 			DriverConfig: &api.Driver{},
 			IPAM: &api.IPAMOptions{
-				Driver: &api.Driver{},
-				Configs: []*api.IPAMConfig{
-					{
-						Subnet: "10.255.0.0/16",
-					},
-				},
+				Driver:  &api.Driver{},
+				Configs: []*api.IPAMConfig{},
 			},
 		},
 	}

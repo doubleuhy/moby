@@ -53,7 +53,6 @@ import (
 	"time"
 
 	"github.com/docker/docker/pkg/discovery"
-	"github.com/docker/docker/pkg/locker"
 	"github.com/docker/docker/pkg/plugingetter"
 	"github.com/docker/docker/pkg/plugins"
 	"github.com/docker/docker/pkg/stringid"
@@ -67,8 +66,10 @@ import (
 	"github.com/docker/libnetwork/hostdiscovery"
 	"github.com/docker/libnetwork/ipamapi"
 	"github.com/docker/libnetwork/netlabel"
+	"github.com/docker/libnetwork/options"
 	"github.com/docker/libnetwork/osl"
 	"github.com/docker/libnetwork/types"
+	"github.com/moby/locker"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -252,6 +253,7 @@ func New(cfgOptions ...config.Option) (NetworkController, error) {
 		return nil, err
 	}
 
+	setupArrangeUserFilterRule(c)
 	return c, nil
 }
 
@@ -339,7 +341,6 @@ func (c *controller) clusterAgentInit() {
 				}
 			}
 		case cluster.EventNodeLeave:
-			keysAvailable = false
 			c.agentOperationStart()
 			c.Lock()
 			c.keys = nil
@@ -706,11 +707,18 @@ const overlayDSROptionString = "dsr"
 // NewNetwork creates a new network of the specified network type. The options
 // are network specific and modeled in a generic way.
 func (c *controller) NewNetwork(networkType, name string, id string, options ...NetworkOption) (Network, error) {
+	var (
+		cap            *driverapi.Capability
+		err            error
+		t              *network
+		skipCfgEpCount bool
+	)
+
 	if id != "" {
 		c.networkLocker.Lock(id)
 		defer c.networkLocker.Unlock(id)
 
-		if _, err := c.NetworkByID(id); err == nil {
+		if _, err = c.NetworkByID(id); err == nil {
 			return nil, NetworkNameError(id)
 		}
 	}
@@ -739,14 +747,9 @@ func (c *controller) NewNetwork(networkType, name string, id string, options ...
 	}
 
 	network.processOptions(options...)
-	if err := network.validateConfiguration(); err != nil {
+	if err = network.validateConfiguration(); err != nil {
 		return nil, err
 	}
-
-	var (
-		cap *driverapi.Capability
-		err error
-	)
 
 	// Reset network types, force local scope and skip allocation and
 	// plumbing for configuration networks. Reset of the config-only
@@ -794,15 +797,16 @@ func (c *controller) NewNetwork(networkType, name string, id string, options ...
 	// From this point on, we need the network specific configuration,
 	// which may come from a configuration-only network
 	if network.configFrom != "" {
-		t, err := c.getConfigNetwork(network.configFrom)
+		t, err = c.getConfigNetwork(network.configFrom)
 		if err != nil {
 			return nil, types.NotFoundErrorf("configuration network %q does not exist", network.configFrom)
 		}
-		if err := t.applyConfigurationTo(network); err != nil {
+		if err = t.applyConfigurationTo(network); err != nil {
 			return nil, types.InternalErrorf("Failed to apply configuration: %v", err)
 		}
+		network.generic[netlabel.Internal] = network.internal
 		defer func() {
-			if err == nil {
+			if err == nil && !skipCfgEpCount {
 				if err := t.getEpCnt().IncEndpointCnt(); err != nil {
 					logrus.Warnf("Failed to update reference count for configuration network %q on creation of network %q: %v",
 						t.Name(), network.Name(), err)
@@ -823,7 +827,13 @@ func (c *controller) NewNetwork(networkType, name string, id string, options ...
 
 	err = c.addNetwork(network)
 	if err != nil {
-		return nil, err
+		if _, ok := err.(types.MaskableError); ok {
+			// This error can be ignored and set this boolean
+			// value to skip a refcount increment for configOnly networks
+			skipCfgEpCount = true
+		} else {
+			return nil, err
+		}
 	}
 	defer func() {
 		if err != nil {
@@ -901,8 +911,7 @@ addToStore:
 		arrangeIngressFilterRule()
 		c.Unlock()
 	}
-
-	c.arrangeUserFilterRule()
+	arrangeUserFilterRule()
 
 	return network, nil
 }
@@ -971,6 +980,10 @@ func (c *controller) reservePools() {
 			continue
 		}
 		for _, ep := range epl {
+			if ep.Iface() == nil {
+				logrus.Warnf("endpoint interface is empty for %q (%s)", ep.Name(), ep.ID())
+				continue
+			}
 			if err := ep.assignAddress(ipam, true, ep.Iface().AddressIPv6() != nil); err != nil {
 				logrus.Warnf("Failed to reserve current address for endpoint %q (%s) on network %q (%s)",
 					ep.Name(), ep.ID(), n.Name(), n.ID())
@@ -1007,12 +1020,7 @@ func (c *controller) addNetwork(n *network) error {
 func (c *controller) Networks() []Network {
 	var list []Network
 
-	networks, err := c.getNetworksFromStore()
-	if err != nil {
-		logrus.Error(err)
-	}
-
-	for _, n := range networks {
+	for _, n := range c.getNetworksFromStore() {
 		if n.inDelete {
 			continue
 		}
@@ -1298,7 +1306,7 @@ func (c *controller) loadIPAMDriver(name string) error {
 	}
 
 	if err != nil {
-		if err == plugins.ErrNotFound {
+		if errors.Cause(err) == plugins.ErrNotFound {
 			return types.NotFoundErrorf(err.Error())
 		}
 		return err
@@ -1354,4 +1362,28 @@ func (c *controller) IsDiagnosticEnabled() bool {
 	c.Lock()
 	defer c.Unlock()
 	return c.DiagnosticServer.IsDiagnosticEnabled()
+}
+
+func (c *controller) iptablesEnabled() bool {
+	c.Lock()
+	defer c.Unlock()
+
+	if c.cfg == nil {
+		return false
+	}
+	// parse map cfg["bridge"]["generic"]["EnableIPTable"]
+	cfgBridge, ok := c.cfg.Daemon.DriverCfg["bridge"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	cfgGeneric, ok := cfgBridge[netlabel.GenericData].(options.Generic)
+	if !ok {
+		return false
+	}
+	enabled, ok := cfgGeneric["EnableIPTables"].(bool)
+	if !ok {
+		// unless user explicitly stated, assume iptable is enabled
+		enabled = true
+	}
+	return enabled
 }
